@@ -986,6 +986,8 @@ public class MaterialGraphViewModel
             catch (Exception e) { lastError = e.Message; continue; }
 
             if (!candidate.Success) { lastError = candidate.FailureReason; continue; }
+            candidate.ShaderTypeName = HashedNamesProvider.TryGetEntry(shader.Type.Hash, out var tn) && !string.IsNullOrEmpty(tn)
+                ? $"{tn}, SM6 DXIL" : "SM6 DXIL";
             if (best == null || candidate.PinSources.Count > best.PinSources.Count) best = candidate;
             if (best.PinSources.Count >= 5) break; // the base-pass PS wires the full GBuffer
         }
@@ -1435,10 +1437,14 @@ public class MaterialGraphViewModel
         private string SharedUniformRootName(PixelExpressionNode expr)
         {
             if (expr.Op != "cbrow" || expr.Source is not { } source) return null;
-            var name = source.Kind == PixelValueKind.VectorExpression
-                ? $"Vector Expression [{source.Index}]"
-                : $"Scalar Expression [{source.Index}]";
-            return _uniformRoots.ContainsKey(name) ? name : null;
+            var name = source.Kind switch
+            {
+                PixelValueKind.VectorExpression => $"Vector Expression [{source.Index}]",
+                PixelValueKind.ScalarExpression => $"Scalar Expression [{source.Index}]",
+                PixelValueKind.UniformExpression => $"Uniform Expression [{source.Index}]",
+                _ => null
+            };
+            return name != null && _uniformRoots.ContainsKey(name) ? name : null;
         }
 
         private (MaterialGraphNode Node, string OutPin) Emit(PixelExpressionNode expr)
@@ -2304,7 +2310,7 @@ public class MaterialGraphViewModel
     private void BuildShaderInventory(List<UMaterialInterface> chain)
     {
         var shaderMap = FindLegacyShaderMap(chain, out _);
-        if (shaderMap == null) return;
+        if (shaderMap == null) { BuildModernShaderInventory(chain); return; }
         var expressionSet = shaderMap.MaterialCompilationOutput?.UniformExpressionSet;
         var resolver = CreateLegacyShaderCodeResolver(chain);
 
@@ -2344,6 +2350,66 @@ public class MaterialGraphViewModel
         AddShaders(shaderMap.Shaders, string.Empty);
         foreach (var meshMap in shaderMap.MeshShaderMaps ?? [])
             AddShaders(meshMap.Shaders, meshMap.VertexFactoryTypeName);
+    }
+
+    /// <summary>
+    /// UE5 shader inventory. The modern (IoStore) shader map stores its shaders as <see cref="FShader"/>
+    /// with hashed type names and bytecode in the shared shader library, so the legacy path finds
+    /// nothing. Each shader's SM6 DXIL bytecode is pulled from the library on demand and summarized.
+    /// </summary>
+    private void BuildModernShaderInventory(List<UMaterialInterface> chain)
+    {
+        UMaterialInterface owner = null;
+        FMaterialShaderMap map = null;
+        foreach (var material in chain)
+        {
+            map = material.LoadedMaterialResources?.FirstOrDefault(r => r.LoadedShaderMap != null)?.LoadedShaderMap;
+            if (map == null) continue;
+            owner = material;
+            break;
+        }
+        if (map?.Content is not FMaterialShaderMapContent content) return;
+        var provider = owner.Owner?.Provider as IVfsFileProvider;
+        // pre-UE5 games also use the modern shader map, but their bytecode is SM5 DXBC, not SM6 DXIL —
+        // only UE5 shaders live in the IoStore library and decode with the DXIL summarizer below
+        if ((provider?.Versions.Game ?? EGame.GAME_UE4_LATEST) < EGame.GAME_UE5_0) return;
+        var resourceHash = map.ResourceHash;
+
+        static string ResolveName(FHashedName h) =>
+            HashedNamesProvider.TryGetEntry(h.Hash, out var n) && !string.IsNullOrEmpty(n) ? n : h.Hash.ToString("X16");
+        // a raw hash reads as noise in the vertex-factory column, so leave it blank when unresolved
+        static string ResolveNameOrEmpty(FHashedName h) =>
+            HashedNamesProvider.TryGetEntry(h.Hash, out var n) && !string.IsNullOrEmpty(n) ? n : string.Empty;
+
+        void AddShaders(FShader[] shaders, string vertexFactory)
+        {
+            foreach (var shader in shaders ?? [])
+            {
+                if (shader == null) continue;
+                var resIdx = shader.ResourceIndex;
+                Shaders.Add(new MaterialShaderEntry(() =>
+                {
+                    if (provider == null || resourceHash is not { } rh)
+                        return "// no IoStore provider or shader-map resource hash to retrieve bytecode";
+                    var blob = MaterialDxilLibrary.TryGetShaderCode(provider, rh, resIdx, out var err);
+                    if (blob is not { Length: > 0 })
+                        return $"// {err ?? "bytecode not found in the shared shader library"}";
+                    try { return MaterialDxilLibrary.Describe(blob); }
+                    catch (Exception e) { return $"// DXIL summary failed: {e.Message}"; }
+                })
+                {
+                    TypeName = ResolveName(shader.Type),
+                    Frequency = shader.Target.Frequency.ToString().Replace("SF_", ""),
+                    VertexFactory = string.IsNullOrEmpty(vertexFactory) ? ResolveNameOrEmpty(shader.VFType) : vertexFactory,
+                    OutputHash = string.Empty,
+                    CodeInfo = $"SM6 DXIL in shared shader library, {shader.NumInstructions} instructions"
+                });
+            }
+        }
+
+        AddShaders(content.Shaders, string.Empty);
+        foreach (var meshMap in content.OrderedMeshShaderMaps ?? [])
+            AddShaders(meshMap.Shaders, ResolveNameOrEmpty(meshMap.VertexFactoryTypeName));
     }
 
     /// <summary>EShaderFrequency names per 4.23 RHIDefinitions.h.</summary>

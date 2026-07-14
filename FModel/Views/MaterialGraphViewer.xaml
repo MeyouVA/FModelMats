@@ -6,6 +6,7 @@
         xmlns:adonisControls="clr-namespace:AdonisUI.Controls;assembly=AdonisUI"
         xmlns:adonisExtensions="clr-namespace:AdonisUI.Extensions;assembly=AdonisUI"
         WindowStartupLocation="CenterScreen" IconVisibility="Collapsed"
+        PreviewKeyDown="OnWindowPreviewKeyDown"
         Height="{Binding Source={x:Static SystemParameters.MaximizedPrimaryScreenHeight}, Converter={converters:RatioConverter}, ConverterParameter='0.75'}"
         Width="{Binding Source={x:Static SystemParameters.MaximizedPrimaryScreenWidth}, Converter={converters:RatioConverter}, ConverterParameter='0.75'}">
     <adonisControls:AdonisWindow.Style>
@@ -25,7 +26,7 @@
         <Border Grid.Row="0" Padding="8 4"
                 Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BackgroundBrush}}"
                 adonisExtensions:LayerExtension.IncreaseLayer="True">
-            <StackPanel Orientation="Horizontal">
+            <WrapPanel Orientation="Horizontal">
                 <TextBlock x:Name="PackageNameText" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0 0 16 0"/>
                 <TextBlock x:Name="NodeCountText" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="ConnectionCountText" VerticalAlignment="Center" Margin="0 0 16 0"/>
@@ -44,7 +45,21 @@
                 <ToggleButton x:Name="UserGraphOnlyButton" Content="User Graph Only" MinWidth="115" Margin="4 0"
                               Visibility="Collapsed" Checked="OnUserGraphOnlyToggled" Unchecked="OnUserGraphOnlyToggled"
                               ToolTip="Hide the engine shader scaffolding entirely and show only the user-authored material nodes wired into the material output, the way the graph looked in the editor."/>
-            </StackPanel>
+
+                <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+                <TextBlock Text="Isolate:" VerticalAlignment="Center" Margin="0 0 4 0" Opacity="0.75"/>
+                <ComboBox x:Name="IsolatePinCombo" MinWidth="130" Margin="0 0 4 0" VerticalAlignment="Center"
+                          SelectionChanged="OnIsolatePinChanged"
+                          ToolTip="Show only the nodes that feed one material output pin. View only — the graph is not changed."/>
+                <ToggleButton x:Name="DetectFunctionsButton" Content="Detect Functions" MinWidth="120" Margin="8 0 4 0"
+                              Checked="OnDetectFunctionsToggled" Unchecked="OnDetectFunctionsToggled"
+                              ToolTip="Highlight repeated sub-graph patterns. A material function inlined at cook time leaves an identical duplicated pattern each time it was used; matching colors mark those copies. View only."/>
+                <Button x:Name="HideSelectedButton" Content="Hide (H)" MinWidth="70" Margin="8 0 4 0" Click="OnHideSelectedClicked"
+                        ToolTip="Hide the selected nodes and their connections (keyboard: H). Adds to whatever is already hidden."/>
+                <Button x:Name="UnhideAllButton" Content="Unhide All" MinWidth="80" Margin="4 0" Click="OnUnhideAllClicked"
+                        ToolTip="Show every hidden node again (keyboard: Alt+H)."/>
+            </WrapPanel>
         </Border>
 
         <!-- Reconstruction notice -->
@@ -99,7 +114,8 @@
                 <TextBlock x:Name="ZoomText" Text="Zoom: 100%" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="ParentChainText" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="SelectedNodeText" VerticalAlignment="Center" Margin="0 0 16 0"/>
-                <TextBlock Text="LMB drag: select / move  •  Shift+click: add  •  RMB/MMB drag: pan  •  Wheel: zoom"
+                <TextBlock x:Name="HiddenCountText" VerticalAlignment="Center" Margin="0 0 16 0" Opacity="0.7"/>
+                <TextBlock Text="LMB drag: select / move  •  Shift+click: add  •  RMB/MMB drag: pan  •  Wheel: zoom  •  H: hide sel.  •  Alt+H: unhide all"
                            VerticalAlignment="Center" Opacity="0.55"/>
             </StackPanel>
         </Border>

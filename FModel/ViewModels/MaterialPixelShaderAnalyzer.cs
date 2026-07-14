@@ -223,11 +223,13 @@ public static class MaterialPixelShaderAnalyzer
             if (stores.Count == 0) { wiring.FailureReason = "the DXIL pixel shader writes no output registers"; return wiring; }
 
             var outLeaves = new Dictionary<(int Sig, int Col), List<DxLeaf>>();
+            var storeValues = new List<(int Sig, int Col, int ValId)>();
             foreach (var st in stores)
             {
                 var sig = (int) (DxilTaint.ConstOp(fn, st, 1) ?? -1);
                 var col = (int) (DxilTaint.ConstOp(fn, st, 3) ?? -1);
                 var valId = st.Operands.Count > 4 ? st.Operands[4] : -1;
+                storeValues.Add((sig, col, valId));
                 if (!outLeaves.TryGetValue((sig, col), out var list)) outLeaves[(sig, col)] = list = new List<DxLeaf>();
                 list.AddRange(DxilTaint.Taint(fn, resources, handles, valId, col));
             }
@@ -308,9 +310,37 @@ public static class MaterialPixelShaderAnalyzer
                 }
             }
 
+            // Expand Shader Math (UE5): recover each wired pin's expression DAG from the same stores,
+            // so the graph can optionally show one node per decoded DXIL instruction instead of an
+            // opaque combiner. Auxiliary — never fails the wiring; leaves reuse the same material sources.
+            try
+            {
+                var pinComponents = new Dictionary<string, List<(int Col, PixelExpressionNode Expr)>>();
+                foreach (var (sig, col, valId) in storeValues)
+                {
+                    var pin = PinFor(sig, col);
+                    if (pin == null || valId < 0) continue;
+                    var expr = DxilTaint.BuildExpression(fn, resources, handles, valId, col, Resolve);
+                    if (!pinComponents.TryGetValue(pin, out var comps))
+                        pinComponents[pin] = comps = new List<(int, PixelExpressionNode)>();
+                    comps.Add((col, expr));
+                }
+                foreach (var (pin, comps) in pinComponents)
+                {
+                    if (!wiring.PinSources.ContainsKey(pin)) continue; // only expand pins that actually wired
+                    var ordered = comps.OrderBy(c => c.Col).Select(c => c.Expr).ToList();
+                    if (ordered.Count == 1) { wiring.PinExpressions[pin] = ordered[0]; continue; }
+                    var append = new PixelExpressionNode { Op = "append" };
+                    for (var i = 0; i < ordered.Count; i++)
+                        append.Args.Add(new PixelExpressionArg { Node = ordered[i], Name = i < 4 ? "xyzw"[i].ToString() : $"c{i}" });
+                    wiring.PinExpressions[pin] = append;
+                }
+            }
+            catch { /* the opaque combiner remains the fallback */ }
+
             wiring.Success = wiring.PinSources.Count > 0;
             if (!wiring.Success) wiring.FailureReason = "no serialized material value reaches an output pin";
-            wiring.ShaderTypeName = "base-pass pixel shader (SM6 DXIL)";
+            wiring.ShaderTypeName = "SM6 DXIL";
         }
         catch (Exception e)
         {

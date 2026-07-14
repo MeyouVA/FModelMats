@@ -99,6 +99,70 @@ internal static class MaterialDxilLibrary
         error = "this material's shader map was not found in any shader library";
         return null;
     }
+
+    /// <summary>
+    /// Concise, honest summary of a compiled SM6 DXIL shader for the Shaders panel: container
+    /// chunks, entry instruction count, the render targets it writes, and a histogram of the
+    /// dx.op intrinsics it uses. Everything comes from the decoded bitstream — no invented text.
+    /// A full LLVM-IR disassembly is out of scope; this describes what the analyzer actually reads.
+    /// </summary>
+    public static string Describe(byte[] blob)
+    {
+        var sb = new StringBuilder();
+        sb.Append("// SM6 DXIL shader — ").Append(blob.Length.ToString("N0")).AppendLine(" bytes (from the IoStore shared shader library)");
+
+        var dxbcAt = -1;
+        for (var i = 0; i + 4 <= Math.Min(blob.Length, 4096); i++)
+            if (blob[i] == 'D' && blob[i + 1] == 'X' && blob[i + 2] == 'B' && blob[i + 3] == 'C') { dxbcAt = i; break; }
+        if (dxbcAt >= 0)
+        {
+            try
+            {
+                var p = dxbcAt + 4 + 16 + 4 + 4; // magic + hash + version + total size
+                int chunkCount = BitConverter.ToInt32(blob, p); p += 4;
+                var names = new List<string>();
+                for (var i = 0; i < chunkCount && i < 24; i++)
+                {
+                    int off = BitConverter.ToInt32(blob, p + i * 4);
+                    if (dxbcAt + off + 4 > blob.Length) break;
+                    names.Add(new string(new[] { (char) blob[dxbcAt + off], (char) blob[dxbcAt + off + 1], (char) blob[dxbcAt + off + 2], (char) blob[dxbcAt + off + 3] }));
+                }
+                sb.Append("// DXBC container chunks: ").AppendLine(string.Join(", ", names));
+            }
+            catch { /* the histogram below is the real payload */ }
+        }
+
+        DxilModule m;
+        try { m = DxilModule.Parse(blob); }
+        catch (Exception e) { sb.Append("// DXIL bitcode parse failed: ").AppendLine(e.Message); return sb.ToString(); }
+
+        var fn = m.Functions.FirstOrDefault();
+        if (fn == null) { sb.AppendLine("// no function body in the bitcode"); return sb.ToString(); }
+        sb.Append("// entry function: ").Append(fn.Instructions.Count).AppendLine(" instructions");
+
+        var stores = fn.Instructions.Where(i => i.Callee != null && i.Callee.StartsWith("dx.op.storeOutput")).ToList();
+        if (stores.Count > 0)
+        {
+            sb.Append("// writes ").Append(stores.Count).AppendLine(" output component(s):");
+            foreach (var st in stores)
+            {
+                var sig = DxilTaint.ConstOp(fn, st, 1);
+                var col = DxilTaint.ConstOp(fn, st, 3);
+                sb.Append("//   storeOutput  SV_Target").Append(sig?.ToString() ?? "?").Append('.').AppendLine(col?.ToString() ?? "?");
+            }
+        }
+
+        var intrinsics = fn.Instructions
+            .Where(i => i.Callee != null && i.Callee.StartsWith("dx.op."))
+            .GroupBy(i => i.Callee).OrderByDescending(g => g.Count()).ToList();
+        if (intrinsics.Count > 0)
+        {
+            sb.AppendLine("// DXIL intrinsics used:");
+            foreach (var g in intrinsics)
+                sb.Append("//   ").Append(g.Count().ToString().PadLeft(4)).Append("x  ").AppendLine(g.Key);
+        }
+        return sb.ToString();
+    }
 }
 
 // Minimal LLVM 3.7 bitstream reader + DXIL module decoder, enough to run cbuffer/texture -> output
@@ -359,6 +423,8 @@ internal sealed class DxValue
     public string Name;
     public bool HasConstInt;
     public long ConstInt;
+    public bool HasConstFloat;
+    public float ConstFloat;
     public bool IsAggregate;
     public List<int> AggregateElems;
     public DxInstr Instr;
@@ -553,6 +619,7 @@ internal sealed class DxilModule
                 var instr = new DxInstr { Code = "BINOP" };
                 instr.Operands.Add(Rel(rec.Fields[0]));
                 instr.Operands.Add(Rel(rec.Fields[1]));
+                instr.Aux = rec.Fields.Count > 2 ? (long) rec.Fields[2] : -1; // LLVM binary opcode
                 AddValue(instr);
                 return;
             }
@@ -624,6 +691,15 @@ internal sealed class DxilModule
         {
             case 2: v.HasConstInt = true; v.ConstInt = 0; break;                                    // NULL
             case 4: v.HasConstInt = true; v.ConstInt = DecodeSignedVBR(rec.Fields.ElementAtOrDefault(0)); break; // INTEGER
+            case 6: // FLOAT — the field is the raw IEEE-754 bit pattern; width is untracked so 32-bit floats
+            {       // (the norm in material math) decode exact, wider constants fall back to a double read
+                var bits = rec.Fields.ElementAtOrDefault(0);
+                v.HasConstFloat = true;
+                v.ConstFloat = bits <= uint.MaxValue
+                    ? BitConverter.Int32BitsToSingle((int) (uint) bits)
+                    : (float) BitConverter.Int64BitsToDouble((long) bits);
+                break;
+            }
             case 7: v.IsAggregate = true; v.AggregateElems = rec.Fields.Select(f => (int) f).ToList(); break;    // AGGREGATE
         }
         return v;
@@ -804,6 +880,164 @@ internal static class DxilTaint
             // loadInput / rawBufferLoad / other: engine/vertex data, not a material source — dropped
         }
     }
+
+    /// <summary>
+    /// Builds a per-output expression DAG (for the "Expand Shader Math" view) rooted at one
+    /// storeOutput value: one <see cref="PixelExpressionNode"/> per decoded DXIL instruction, with
+    /// cbuffer/texture leaves mapped to material sources through <paramref name="resolveLeaf"/>.
+    /// Mirrors <see cref="Taint"/>'s traversal exactly; anything unmodeled becomes an honest opaque
+    /// leaf, and shared sub-values are memoized so the emitted graph reuses nodes.
+    /// </summary>
+    public static PixelExpressionNode BuildExpression(DxFunction fn, List<DxResource> resources,
+        Dictionary<int, DxBinding> handles, int valueId, int component, Func<DxLeaf, PixelValueSource?> resolveLeaf)
+    {
+        var memo = new Dictionary<(int, int), PixelExpressionNode>();
+        return Build(valueId, component);
+
+        PixelExpressionNode Build(int id, int comp)
+        {
+            if (memo.TryGetValue((id, comp), out var cached)) return cached;
+            memo[(id, comp)] = new PixelExpressionNode { Op = "opaque", Detail = "cyclic value" }; // break cycles
+            var built = BuildInner(id, comp);
+            memo[(id, comp)] = built;
+            return built;
+        }
+
+        PixelExpressionNode BuildInner(int id, int comp)
+        {
+            var v = ValById(fn, id);
+            if (v == null) return new PixelExpressionNode { Op = "opaque", Detail = $"value {id}" };
+            if (v.HasConstFloat) return new PixelExpressionNode { Op = "imm", Constants = new[] { v.ConstFloat } };
+            if (v.HasConstInt) return new PixelExpressionNode { Op = "imm", Constants = new[] { (float) v.ConstInt } };
+            if (v.Instr == null) return new PixelExpressionNode { Op = "opaque", Detail = "shader input" };
+
+            var ins = v.Instr;
+            switch (ins.Code)
+            {
+                case "EXTRACTVAL":
+                {
+                    var aggId = ins.Operands.Count > 0 ? ins.Operands[0] : -1;
+                    var agg = ValById(fn, aggId);
+                    if (agg?.Instr is { Code: "CALL" } call && call.Callee != null)
+                        return CallNode(call, (int) ins.Aux);
+                    return Build(aggId, (int) ins.Aux);
+                }
+                case "CALL": return CallNode(ins, comp);
+                case "CAST": return ins.Operands.Count > 0 ? Build(ins.Operands[0], comp) : Opaque("cast");
+                case "BINOP":
+                {
+                    var node = new PixelExpressionNode { Op = LlvmBinOp(ins.Aux) };
+                    AddArgs(node, ins.Operands, 0, comp, "A", "B");
+                    return node;
+                }
+                case "SELECT":
+                {
+                    var node = new PixelExpressionNode { Op = "movc" };
+                    AddArgs(node, ins.Operands, 0, comp, "Cond", "True", "False");
+                    return node;
+                }
+                case "PHI":
+                {
+                    var node = new PixelExpressionNode { Op = "phi", Detail = "differs between branches" };
+                    AddArgs(node, ins.Operands, 0, comp);
+                    return node;
+                }
+                case "CMP":
+                {
+                    var node = new PixelExpressionNode { Op = "compare" };
+                    AddArgs(node, ins.Operands, 0, comp, "A", "B");
+                    return node;
+                }
+                case "VEC":
+                {
+                    var node = new PixelExpressionNode { Op = "append" };
+                    AddArgs(node, ins.Operands, 0, comp);
+                    return node;
+                }
+                default: return Opaque(ins.Code.ToLowerInvariant());
+            }
+        }
+
+        PixelExpressionNode CallNode(DxInstr call, int comp)
+        {
+            var callee = call.Callee ?? "";
+            if (callee.StartsWith("dx.op.cbufferLoad"))
+            {
+                var handleId = call.Operands.Count > 1 ? call.Operands[1] : -1;
+                var row = (int) (ConstOperand(fn, call, 2) ?? -1);
+                var reg = handles.TryGetValue(handleId, out var b) ? (ResolveResource(resources, b)?.Register ?? b.Register) : -1;
+                var src = resolveLeaf(new DxLeaf { Kind = "cbuffer", Register = reg, Row = row, Component = comp });
+                return new PixelExpressionNode { Op = "cbrow", Source = src, Detail = src == null ? $"cb{reg}[{row}].{Comp(comp)}" : string.Empty };
+            }
+            if (callee.StartsWith("dx.op.sample") || callee.StartsWith("dx.op.textureLoad") || callee.StartsWith("dx.op.textureGather"))
+            {
+                var handleId = call.Operands.Count > 1 ? call.Operands[1] : -1;
+                var reg = handles.TryGetValue(handleId, out var b) ? (ResolveResource(resources, b)?.Register ?? b.Register) : -1;
+                var src = resolveLeaf(new DxLeaf { Kind = "texture", Register = reg, Component = comp });
+                return new PixelExpressionNode { Op = "sample", Source = src, Detail = src == null ? "texture sample" : string.Empty };
+            }
+            if (callee.StartsWith("dx.op.unary"))
+            {
+                var node = new PixelExpressionNode { Op = UnaryName((int) (ConstOperand(fn, call, 0) ?? -1)) };
+                AddArgs(node, call.Operands, 1, comp, "X"); // operand[0] is the DXIL opcode immediate
+                return node;
+            }
+            if (callee.StartsWith("dx.op.binary"))
+            {
+                var node = new PixelExpressionNode { Op = BinaryName((int) (ConstOperand(fn, call, 0) ?? -1)) };
+                AddArgs(node, call.Operands, 1, comp, "A", "B");
+                return node;
+            }
+            if (callee.StartsWith("dx.op.tertiary"))
+            {
+                var node = new PixelExpressionNode { Op = "mad" };
+                AddArgs(node, call.Operands, 1, comp, "A", "B", "C");
+                return node;
+            }
+            if (callee.StartsWith("dx.op.dot"))
+            {
+                var op = callee.Contains("dot2") ? "dp2" : callee.Contains("dot4") ? "dp4" : "dp3";
+                var node = new PixelExpressionNode { Op = op };
+                AddArgs(node, call.Operands, 1, comp);
+                return node;
+            }
+            if (callee.StartsWith("dx.op.loadInput"))
+                return new PixelExpressionNode { Op = "input", Detail = "vertex interpolant" };
+            return Opaque(callee.Replace("dx.op.", string.Empty));
+        }
+
+        void AddArgs(PixelExpressionNode node, List<int> operands, int start, int comp, params string[] names)
+        {
+            for (var i = start; i < operands.Count; i++)
+                node.Args.Add(new PixelExpressionArg
+                {
+                    Node = Build(operands[i], comp),
+                    Name = i - start < names.Length ? names[i - start] : ArgName(i - start)
+                });
+        }
+
+        static PixelExpressionNode Opaque(string detail) => new() { Op = "opaque", Detail = detail };
+        static string Comp(int c) => c is >= 0 and <= 3 ? "xyzw"[c].ToString() : "?";
+        static string ArgName(int i) => i < 26 ? ((char) ('A' + i)).ToString() : $"in{i}";
+    }
+
+    private static string LlvmBinOp(long aux) => aux switch
+    {
+        0 => "add", 1 => "sub", 2 => "mul", 3 => "div", 4 => "div", 5 => "udiv_rem", 6 => "udiv_rem",
+        7 => "ishl", 8 => "ushr", 9 => "ishr", 10 => "and", 11 => "or", 12 => "xor", _ => "op"
+    };
+
+    private static string UnaryName(int op) => op switch
+    {
+        12 => "cos", 13 => "sin", 14 => "tan", 15 => "acos", 16 => "asin", 17 => "atan",
+        21 => "exp", 22 => "frc", 23 => "log", 24 => "sqrt", 25 => "rsq",
+        26 => "round_ne", 27 => "round_ni", 28 => "round_pi", 29 => "round_z", _ => "unary"
+    };
+
+    private static string BinaryName(int op) => op switch
+    {
+        35 => "max", 36 => "min", 37 => "imax", 38 => "imin", 39 => "umax", 40 => "umin", _ => "binary"
+    };
 
     private static List<int> MdNode(DxilModule m, int mdId) => mdId >= 0 && mdId < m.Md.Count && m.Md[mdId].Kind == MdKind.Node ? m.Md[mdId].Operands : null;
     private static long? ConstFromMd(DxilModule m, int mdId)

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -45,6 +46,23 @@ public partial class MaterialGraphViewer
 
     /// <summary>View-only: dim engine scaffolding so the user-authored material nodes stand out.</summary>
     private bool _highlightUserGraph;
+
+    /// <summary>Nodes the user hid with H; cumulative until Alt+H. Hidden nodes and their edges are not drawn.</summary>
+    private readonly HashSet<MaterialGraphNode> _hiddenNodes = [];
+    /// <summary>When set, only nodes feeding this material output pin are shown; null shows all.</summary>
+    private string _isolatedPin;
+    /// <summary>The set of nodes kept visible under <see cref="_isolatedPin"/>; null when no pin is isolated.</summary>
+    private HashSet<MaterialGraphNode> _isolatedNodes;
+    /// <summary>View-only: color nodes that belong to a repeated (likely inlined-function) sub-graph pattern.</summary>
+    private bool _detectFunctions;
+    /// <summary>Per-node pattern color when <see cref="_detectFunctions"/> is on; nodes not in a repeat are absent.</summary>
+    private readonly Dictionary<MaterialGraphNode, Color> _patternColorByNode = new();
+    /// <summary>Per-node "N identical copies" count for the repeated-pattern properties readout.</summary>
+    private readonly Dictionary<MaterialGraphNode, int> _patternCountByNode = new();
+    /// <summary>Suppresses the isolate-combo / detect-functions events while their controls are reset programmatically.</summary>
+    private bool _suppressFilterEvents;
+
+    private const string AllPinsLabel = "All Pins";
 
     private MaterialGraphNode _draggedNode;
     private bool _isDraggingNode;
@@ -94,6 +112,8 @@ public partial class MaterialGraphViewer
         ShadersButton.IsEnabled = _viewModel.Shaders.Count > 0;
         ExpandMathButton.Visibility = _viewModel.CanExpandPixelShaderMath ? Visibility.Visible : Visibility.Collapsed;
         UpdateUserGraphButtons();
+        PopulateIsolatePinCombo();
+        UpdateHiddenCount();
 
         SetupCanvas();
         DrawGraph();
@@ -142,6 +162,8 @@ public partial class MaterialGraphViewer
 
         _selectedNode = null;
         _selectedNodes.Clear();
+        // the rebuild recreates every node object, so filters holding old references are reset
+        ResetViewFilters();
         NodeCountText.Text = $"Nodes: {_viewModel.Nodes.Count}";
         ConnectionCountText.Text = $"Connections: {_viewModel.Connections.Count}";
         if (!string.IsNullOrEmpty(_viewModel.ReconstructionNote))
@@ -150,6 +172,8 @@ public partial class MaterialGraphViewer
         ShadersButton.Content = $"Shaders ({_viewModel.Shaders.Count})";
         ShadersButton.IsEnabled = _viewModel.Shaders.Count > 0;
         UpdateUserGraphButtons();
+        PopulateIsolatePinCombo();
+        UpdateHiddenCount();
 
         DrawGraph();
         if (_viewModel.MaterialSections.Count > 0)
@@ -196,6 +220,8 @@ public partial class MaterialGraphViewer
 
         _selectedNode = null;
         _selectedNodes.Clear();
+        // the rebuild recreates every node object, so filters holding old references are reset
+        ResetViewFilters();
         NodeCountText.Text = $"Nodes: {_viewModel.Nodes.Count}";
         ConnectionCountText.Text = $"Connections: {_viewModel.Connections.Count}";
         if (!string.IsNullOrEmpty(_viewModel.ReconstructionNote))
@@ -205,12 +231,272 @@ public partial class MaterialGraphViewer
         ShadersButton.IsEnabled = _viewModel.Shaders.Count > 0;
         ExpandMathButton.Visibility = _viewModel.CanExpandPixelShaderMath ? Visibility.Visible : Visibility.Collapsed;
         UpdateUserGraphButtons();
+        PopulateIsolatePinCombo();
+        UpdateHiddenCount();
 
         DrawGraph();
         if (_viewModel.MaterialSections.Count > 0)
             ShowMaterialDetails();
         FitToView();
     }
+
+    /// <summary>
+    /// Clears the view-only filters (hide set, pin isolation, function detection) and resets their
+    /// controls. Called after a rebuild, whose new node objects would leave the old references dangling.
+    /// </summary>
+    private void ResetViewFilters()
+    {
+        _suppressFilterEvents = true;
+        _hiddenNodes.Clear();
+        _isolatedPin = null;
+        _isolatedNodes = null;
+        _detectFunctions = false;
+        _patternColorByNode.Clear();
+        _patternCountByNode.Clear();
+        DetectFunctionsButton.IsChecked = false;
+        _suppressFilterEvents = false;
+    }
+
+    /// <summary>Redraws the graph honoring the current view filters, then restores the selection outline.</summary>
+    private void Redraw()
+    {
+        DrawGraph();
+        foreach (var node in _selectedNodes)
+            if (IsNodeVisible(node)) ApplySelectionVisual(node, true);
+    }
+
+    // ---- Output-pin isolation (view only) ----
+
+    /// <summary>Fills the isolate combo with "All Pins" plus every material output pin that has an incoming connection.</summary>
+    private void PopulateIsolatePinCombo()
+    {
+        _suppressFilterEvents = true;
+        IsolatePinCombo.Items.Clear();
+        IsolatePinCombo.Items.Add(AllPinsLabel);
+        var outputNode = _viewModel.Nodes.FirstOrDefault(n => n.IsOutputNode);
+        var connected = outputNode == null
+            ? new HashSet<string>()
+            : new HashSet<string>(_viewModel.Connections.Where(c => c.TargetNode == outputNode).Select(c => c.TargetPinName));
+        if (outputNode != null)
+            foreach (var pin in outputNode.InputPins.Where(p => !p.IsEngineStagePin && connected.Contains(p.Name)))
+                IsolatePinCombo.Items.Add(pin.Name);
+        IsolatePinCombo.SelectedIndex = 0;
+        IsolatePinCombo.IsEnabled = IsolatePinCombo.Items.Count > 1;
+        _suppressFilterEvents = false;
+    }
+
+    private void OnIsolatePinChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressFilterEvents || _canvas == null) return;
+        var pin = IsolatePinCombo.SelectedItem as string;
+        if (string.IsNullOrEmpty(pin) || pin == AllPinsLabel)
+        {
+            _isolatedPin = null;
+            _isolatedNodes = null;
+        }
+        else
+        {
+            _isolatedPin = pin;
+            _isolatedNodes = ComputeUpstreamNodes(pin);
+        }
+        Redraw();
+        FitToView();
+    }
+
+    /// <summary>The output node plus every node that feeds one output pin, walking connections backwards.</summary>
+    private HashSet<MaterialGraphNode> ComputeUpstreamNodes(string pinName)
+    {
+        var set = new HashSet<MaterialGraphNode>();
+        var outputNode = _viewModel.Nodes.FirstOrDefault(n => n.IsOutputNode);
+        if (outputNode == null) return set;
+        set.Add(outputNode);
+
+        var incoming = _viewModel.Connections.ToLookup(c => c.TargetNode);
+        var stack = new Stack<MaterialGraphNode>();
+        foreach (var c in _viewModel.Connections)
+            if (c.TargetNode == outputNode && c.TargetPinName == pinName && c.SourceNode != outputNode)
+                stack.Push(c.SourceNode);
+        while (stack.Count > 0)
+        {
+            var n = stack.Pop();
+            if (!set.Add(n)) continue;
+            foreach (var c in incoming[n])
+                if (c.SourceNode != n) stack.Push(c.SourceNode);
+        }
+        return set;
+    }
+
+    // ---- Detect Functions: repeated sub-graph patterns (view only) ----
+
+    private void OnDetectFunctionsToggled(object sender, RoutedEventArgs e)
+    {
+        if (_suppressFilterEvents || _canvas == null) return;
+        _detectFunctions = DetectFunctionsButton.IsChecked == true;
+        if (_detectFunctions) ComputePatterns();
+        else { _patternColorByNode.Clear(); _patternCountByNode.Clear(); }
+        Redraw();
+    }
+
+    /// <summary>
+    /// Finds repeated sub-graph patterns and colors each copy of a pattern the same color. A material
+    /// function inlined during cooking leaves an identical sub-graph each place it was used (only the
+    /// leaf inputs differ), so structurally identical subtrees that occur more than once are flagged.
+    /// Each node gets a Merkle signature of its operation kind plus its inputs' signatures; the largest
+    /// repeated subtrees win, and their whole body (per copy) is painted one color.
+    /// </summary>
+    private void ComputePatterns()
+    {
+        _patternColorByNode.Clear();
+        _patternCountByNode.Clear();
+
+        // this node's inputs, ordered by the pin they feed so identical bodies hash identically
+        var incoming = new Dictionary<MaterialGraphNode, List<MaterialGraphConnection>>();
+        foreach (var c in _viewModel.Connections)
+        {
+            if (!incoming.TryGetValue(c.TargetNode, out var l)) incoming[c.TargetNode] = l = new List<MaterialGraphConnection>();
+            l.Add(c);
+        }
+        foreach (var l in incoming.Values)
+            l.Sort((a, b) => string.CompareOrdinal(a.TargetPinName, b.TargetPinName));
+
+        var sig = new Dictionary<MaterialGraphNode, string>();
+        var size = new Dictionary<MaterialGraphNode, int>();
+
+        string Compute(MaterialGraphNode node, HashSet<MaterialGraphNode> path)
+        {
+            if (sig.TryGetValue(node, out var cached)) return cached;
+            if (!path.Add(node)) return "~cycle~"; // back-edge guard; not cached
+            var sb = new StringBuilder(CanonicalKind(node));
+            var total = 1;
+            if (incoming.TryGetValue(node, out var ins))
+            {
+                sb.Append('(');
+                foreach (var c in ins)
+                {
+                    sb.Append(c.TargetPinName).Append('=').Append(Compute(c.SourceNode, path)).Append(';');
+                    total += size.GetValueOrDefault(c.SourceNode, 1);
+                }
+                sb.Append(')');
+            }
+            path.Remove(node);
+            sig[node] = sb.ToString();
+            size[node] = total;
+            return sig[node];
+        }
+        foreach (var node in _viewModel.Nodes) Compute(node, new HashSet<MaterialGraphNode>());
+
+        // group non-trivial subtrees by signature, largest first, and color each repeated group's copies
+        var groups = new Dictionary<string, List<MaterialGraphNode>>();
+        foreach (var node in _viewModel.Nodes)
+        {
+            if (size.GetValueOrDefault(node, 1) < 3) continue; // ignore trivial one/two-node fragments
+            if (!groups.TryGetValue(sig[node], out var g)) groups[sig[node]] = g = new List<MaterialGraphNode>();
+            g.Add(node);
+        }
+
+        var claimed = new HashSet<MaterialGraphNode>();
+        var palette = 0;
+        foreach (var grp in groups.Values.Where(g => g.Count >= 2).OrderByDescending(g => size[g[0]]))
+        {
+            if (grp.Any(claimed.Contains)) continue; // nested inside an already-colored larger pattern
+            var color = PatternColor(palette++);
+            foreach (var root in grp)
+                ClaimSubtree(root, incoming, claimed, color, grp.Count);
+            if (palette >= 24) break; // bound the palette and the work
+        }
+    }
+
+    private void ClaimSubtree(MaterialGraphNode root,
+        Dictionary<MaterialGraphNode, List<MaterialGraphConnection>> incoming,
+        HashSet<MaterialGraphNode> claimed, Color color, int copies)
+    {
+        var stack = new Stack<MaterialGraphNode>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var n = stack.Pop();
+            if (!claimed.Add(n)) continue;
+            _patternColorByNode[n] = color;
+            _patternCountByNode[n] = copies;
+            if (incoming.TryGetValue(n, out var ins))
+                foreach (var c in ins)
+                    if (!claimed.Contains(c.SourceNode)) stack.Push(c.SourceNode);
+        }
+    }
+
+    /// <summary>
+    /// Operation identity for pattern matching: the export type, plus the mnemonic for generic math
+    /// ops. Specific values, names and textures are deliberately ignored so the same function used
+    /// with different inputs still matches structurally.
+    /// </summary>
+    private static string CanonicalKind(MaterialGraphNode node)
+    {
+        var kind = node.ExportType;
+        if (kind is "PixelMathOp" or "PreshaderPixelMath") kind += "|" + node.Subtitle;
+        return kind;
+    }
+
+    private static Color PatternColor(int index)
+    {
+        var hue = index * 137.508 % 360.0; // golden-angle spacing keeps successive colors far apart
+        return HsvToColor(hue, 0.72, 1.0);
+    }
+
+    private static Color HsvToColor(double h, double s, double v)
+    {
+        var c = v * s;
+        var x = c * (1 - Math.Abs(h / 60.0 % 2 - 1));
+        var m = v - c;
+        double r = 0, g = 0, b = 0;
+        switch ((int) (h / 60) % 6)
+        {
+            case 0: r = c; g = x; break;
+            case 1: r = x; g = c; break;
+            case 2: g = c; b = x; break;
+            case 3: g = x; b = c; break;
+            case 4: r = x; b = c; break;
+            default: r = c; b = x; break;
+        }
+        return Color.FromRgb((byte) ((r + m) * 255), (byte) ((g + m) * 255), (byte) ((b + m) * 255));
+    }
+
+    // ---- Hide / unhide selected nodes ----
+
+    private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key != Key.H) return;
+        if (Keyboard.FocusedElement is System.Windows.Controls.Primitives.TextBoxBase) return; // don't hijack text editing
+        if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)) UnhideAll();
+        else HideSelected();
+        e.Handled = true;
+    }
+
+    private void OnHideSelectedClicked(object sender, RoutedEventArgs e) => HideSelected();
+    private void OnUnhideAllClicked(object sender, RoutedEventArgs e) => UnhideAll();
+
+    /// <summary>Hides the current selection. Cumulative — already-hidden nodes stay hidden.</summary>
+    private void HideSelected()
+    {
+        if (_canvas == null || _selectedNodes.Count == 0) return;
+        foreach (var n in _selectedNodes) _hiddenNodes.Add(n);
+        _selectedNode = null;
+        _selectedNodes.Clear();
+        UpdateSelectionStatus();
+        UpdateHiddenCount();
+        Redraw();
+    }
+
+    private void UnhideAll()
+    {
+        if (_canvas == null || _hiddenNodes.Count == 0) return;
+        _hiddenNodes.Clear();
+        UpdateHiddenCount();
+        Redraw();
+    }
+
+    private void UpdateHiddenCount() =>
+        HiddenCountText.Text = _hiddenNodes.Count > 0 ? $"Hidden: {_hiddenNodes.Count}" : string.Empty;
 
     private void DrawGraph()
     {
@@ -224,14 +510,24 @@ public partial class MaterialGraphViewer
         // node geometry is deterministic, so pin anchors can be computed
         // up front and connections drawn beneath the nodes
         foreach (var node in _viewModel.Nodes)
-            ComputeNodeGeometry(node);
+            if (IsNodeVisible(node))
+                ComputeNodeGeometry(node);
 
         foreach (var connection in _viewModel.Connections)
-            DrawConnection(connection);
+            if (IsNodeVisible(connection.SourceNode) && IsNodeVisible(connection.TargetNode))
+                DrawConnection(connection);
 
         foreach (var node in _viewModel.Nodes)
-            DrawNode(node);
+            if (IsNodeVisible(node))
+                DrawNode(node);
     }
+
+    /// <summary>
+    /// A node is drawn unless the user hid it (H) or a pin isolation is active and the node does
+    /// not feed that pin. Both filters are view-only — the underlying graph is never modified.
+    /// </summary>
+    private bool IsNodeVisible(MaterialGraphNode node) =>
+        !_hiddenNodes.Contains(node) && (_isolatedNodes == null || _isolatedNodes.Contains(node));
 
     private void ComputeNodeGeometry(MaterialGraphNode node)
     {
@@ -320,8 +616,8 @@ public partial class MaterialGraphViewer
             Height = height,
             CornerRadius = new CornerRadius(NodeCornerRadius),
             Background = new SolidColorBrush(Color.FromArgb(230, 42, 42, 42)),
-            BorderBrush = new SolidColorBrush(Color.FromRgb(20, 20, 20)),
-            BorderThickness = new Thickness(1.5),
+            BorderBrush = DefaultBorderBrush(node),
+            BorderThickness = new Thickness(DefaultBorderThickness(node)),
             SnapsToDevicePixels = true,
             Cursor = Cursors.Hand,
             Opacity = dimmed ? 0.32 : 1.0,
@@ -374,6 +670,17 @@ public partial class MaterialGraphViewer
                 Foreground = new SolidColorBrush(Color.FromArgb(200, 255, 255, 255)),
                 FontSize = 10,
                 TextTrimming = TextTrimming.CharacterEllipsis
+            });
+        }
+        // Detect Functions: a badge marking this node as part of a repeated (inlined-function) pattern
+        if (_detectFunctions && _patternColorByNode.TryGetValue(node, out var badgeColor))
+        {
+            headerStack.Children.Add(new TextBlock
+            {
+                Text = $"⧉ ×{_patternCountByNode.GetValueOrDefault(node, 2)} copies",
+                Foreground = new SolidColorBrush(badgeColor),
+                FontSize = 9,
+                FontWeight = FontWeights.SemiBold
             });
         }
         header.Child = headerStack;
@@ -538,9 +845,18 @@ public partial class MaterialGraphViewer
     private void ApplySelectionVisual(MaterialGraphNode node, bool selected)
     {
         if (!_nodeBorders.TryGetValue(node, out var border)) return;
-        border.BorderBrush = new SolidColorBrush(selected ? Color.FromRgb(255, 200, 60) : Color.FromRgb(20, 20, 20));
+        border.BorderBrush = selected ? new SolidColorBrush(Color.FromRgb(255, 200, 60)) : DefaultBorderBrush(node);
+        border.BorderThickness = new Thickness(selected ? 2.5 : DefaultBorderThickness(node));
         Panel.SetZIndex(border, selected ? 3 : 2);
     }
+
+    /// <summary>Border color of an unselected node: its repeated-pattern color when Detect Functions is on, else the default dark edge.</summary>
+    private Brush DefaultBorderBrush(MaterialGraphNode node) =>
+        _patternColorByNode.TryGetValue(node, out var c) ? new SolidColorBrush(c) : new SolidColorBrush(Color.FromRgb(20, 20, 20));
+
+    /// <summary>Repeated-pattern nodes get a slightly heavier border so the pattern reads at a glance.</summary>
+    private double DefaultBorderThickness(MaterialGraphNode node) =>
+        _patternColorByNode.ContainsKey(node) ? 2.5 : 1.5;
 
     private void UpdateSelectionStatus()
     {
@@ -583,10 +899,26 @@ public partial class MaterialGraphViewer
         PropertiesTitleText.Text = node.Title;
         PropertiesPanel.Children.Clear();
 
+        // synthetic / engine nodes are not self-explanatory the way an authored node is; explain them
+        var explanation = NodeKindExplanation(node);
+        if (explanation != null)
+            PropertiesPanel.Children.Add(new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(38, 120, 160, 255)),
+                CornerRadius = new CornerRadius(3),
+                Padding = new Thickness(6, 4, 6, 4),
+                Margin = new Thickness(0, 0, 0, 6),
+                Child = new TextBlock { Text = explanation, TextWrapping = TextWrapping.Wrap, FontSize = 11, Opacity = 0.95 }
+            });
+
         AddPropertyRow("Name", node.Name);
         AddPropertyRow("Type", node.ExportType);
         if (!string.IsNullOrEmpty(node.Subtitle))
-            AddPropertyRow("Value", node.Subtitle);
+            AddPropertyRow(node.ExportType == "PixelMathUnresolvedCustom" ? "Raw Instruction" : "Value", node.Subtitle);
+
+        if (_detectFunctions && _patternCountByNode.TryGetValue(node, out var copies))
+            AddPropertyRow("Repeated Structure",
+                $"part of a sub-graph pattern that appears {copies} times in this material — likely a material function inlined at cook time");
 
         if (node.DisplayProperties.Count > 0)
         {
@@ -594,6 +926,52 @@ public partial class MaterialGraphViewer
             foreach (var (key, value) in node.DisplayProperties)
                 AddPropertyRow(key, value);
         }
+    }
+
+    /// <summary>
+    /// A short, honest description of what a non-obvious node represents. Authored parameter/texture
+    /// nodes speak for themselves; the synthetic nodes recovered from compiled shader bytecode (an
+    /// unresolved instruction, an opaque math combiner, a whole shader stage, a preshader step, …) do
+    /// not, so clicking one explains what it is. Returns null for ordinary nodes that need no gloss.
+    /// </summary>
+    private static string NodeKindExplanation(MaterialGraphNode node)
+    {
+        if (node.IsOutputNode)
+            return "Material output. Each input pin is a material attribute (Base Color, Roughness, …); compiled engine shader stages recovered from the shader map attach here too.";
+        switch (node.ExportType)
+        {
+            case "PixelMathUnresolvedCustom":
+                return "Unresolved node — a compiled GPU instruction the decoder could not map to a high-level material operation (dynamic addressing, an unmodeled intrinsic, …). The raw instruction is shown below; it is reported honestly rather than guessed.";
+            case "PreshaderPixelMath":
+                return "Pixel Shader Math — several values are combined here by arithmetic baked into the compiled shader. The exact operations live only in the instruction stream; turn on \"Expand Shader Math\" to break this into one node per decoded instruction.";
+            case "CompiledShaderStage":
+                return "A whole compiled shader stage from the material's shader map (vertex, geometry, compute, or a non-base-pass pixel permutation). This is engine scaffolding, not part of the artist's node graph — the properties list the shader types and whether it reads any material parameter.";
+            case "PixelMathConstant":
+                return "A constant value baked into the compiled shader.";
+            case "PixelMathInterpolant":
+                return "A vertex interpolant — data the vertex shader passed to the pixel shader (a texture coordinate, vertex color, …), not a material parameter.";
+            case "PixelMathEngineConstant":
+                return "A value read from an engine constant buffer (View, Primitive, …) rather than the material — driven by the renderer, not the material graph.";
+            case "PixelMathTextureSample":
+                return "A texture sample decoded from the compiled shader. The Tex input is the bound texture; the Channels property shows which components were read.";
+            case "PixelMathAppend":
+                return "Combines components written separately into one vector value.";
+            case "PixelMathMask":
+                return "Selects a subset of a value's components (a swizzle / component mask).";
+            case "PixelMathBranch":
+                return "A value that differs between the branches of an if in the compiled shader (an SSA phi).";
+            case "PixelMathDiscard":
+                return "The clip / discard test compiled from the material's Opacity Mask.";
+            case "PixelMathOp":
+                return "One decoded GPU instruction from the compiled pixel-shader math.";
+        }
+        if (node.ExportType.StartsWith("Preshader"))
+            return "A step of a uniform-expression preshader — CPU-side math the engine evaluates each frame and uploads to the shader's constant buffer (parameters, time, scalar/vector expressions).";
+        if (node.IsTexture)
+            return "A texture bound to the material; the output pins expose the sampled channels.";
+        if (node.IsParameter)
+            return "A material parameter — its value can be overridden per material instance.";
+        return null;
     }
 
     private void OnShowMaterialDetails(object sender, RoutedEventArgs e) => ShowMaterialDetails();
@@ -869,6 +1247,7 @@ public partial class MaterialGraphViewer
                 ClearSelection();
             foreach (var node in _viewModel.Nodes)
             {
+                if (!IsNodeVisible(node)) continue;
                 var size = _nodeSizes.TryGetValue(node, out var s) ? s : (NodeWidth, 150.0);
                 if (marquee.IntersectsWith(new Rect(node.NodePosX, node.NodePosY, size.Item1, size.Item2)))
                     AddToSelection(node);
@@ -946,12 +1325,13 @@ public partial class MaterialGraphViewer
 
     private void FitToView()
     {
-        if (_viewModel.Nodes.Count == 0) return;
+        var visible = _viewModel.Nodes.Where(IsNodeVisible).ToList();
+        if (visible.Count == 0) return;
 
-        var minX = _viewModel.Nodes.Min(n => n.NodePosX);
-        var minY = _viewModel.Nodes.Min(n => n.NodePosY);
-        var maxX = _viewModel.Nodes.Max(n => n.NodePosX + (_nodeSizes.TryGetValue(n, out var s) ? s.width : NodeWidth));
-        var maxY = _viewModel.Nodes.Max(n => n.NodePosY + (_nodeSizes.TryGetValue(n, out var s) ? s.height : 150));
+        var minX = visible.Min(n => n.NodePosX);
+        var minY = visible.Min(n => n.NodePosY);
+        var maxX = visible.Max(n => n.NodePosX + (_nodeSizes.TryGetValue(n, out var s) ? s.width : NodeWidth));
+        var maxY = visible.Max(n => n.NodePosY + (_nodeSizes.TryGetValue(n, out var s) ? s.height : 150));
 
         var graphWidth = maxX - minX;
         var graphHeight = maxY - minY;
