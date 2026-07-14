@@ -1640,6 +1640,54 @@ public class CUE4ParseViewModel : ViewModel
         }
     }
 
+    public void ShowBlueprintGraph(GameFile entry)
+    {
+        // the Kismet bytecode is only deserialized when script reading is enabled; force it on for the
+        // extraction (exports deserialize lazily, so it must stay set for the whole walk) then restore it
+        var readScriptData = Provider.ReadScriptData;
+        Provider.ReadScriptData = true;
+        try
+        {
+            var package = Provider.LoadPackage(entry);
+            var exports = package.GetExports().ToList();
+
+            var classExport = exports.OfType<UClass>().FirstOrDefault();
+            // draw every function that actually carries compiled bytecode, in export order
+            var functions = exports.OfType<UFunction>()
+                .Where(f => f.ScriptBytecode is { Length: > 0 })
+                .ToList();
+
+            if (functions.Count == 0)
+            {
+                FLogger.Append(ELog.Warning, () => FLogger.Text($"No Blueprint bytecode found in '{entry.Name}'", Constants.WHITE, true));
+                return;
+            }
+
+            var graph = BlueprintGraphViewModel.Build(package.Name, classExport, functions);
+            if (graph.Nodes.Count == 0)
+            {
+                FLogger.Append(ELog.Warning, () => FLogger.Text($"No Blueprint graph could be reconstructed from '{entry.Name}'", Constants.WHITE, true));
+                return;
+            }
+
+            var windowTitle = string.IsNullOrEmpty(graph.ClassName)
+                ? "Blueprint Graph Viewer"
+                : $"Blueprint Graph Viewer - {graph.ClassName}";
+            Application.Current.Dispatcher.Invoke(delegate
+            {
+                Helper.GetWindow<BlueprintGraphViewer>(windowTitle, () => new BlueprintGraphViewer(graph).Show());
+            });
+        }
+        catch (Exception e)
+        {
+            FLogger.Append(ELog.Warning, () => FLogger.Text($"Failed to extract Blueprint graph: {e.Message}", Constants.WHITE, true));
+        }
+        finally
+        {
+            Provider.ReadScriptData = readScriptData;
+        }
+    }
+
     public void FindReferences(GameFile entry)
     {
         var refs = Provider.ScanForPackageRefs(entry);
