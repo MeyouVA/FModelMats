@@ -6,6 +6,7 @@ using System.Text;
 using CUE4Parse.Compression;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Shaders;
+using CUE4Parse.UE4.Versions;
 using CUE4Parse.Utils;
 
 namespace FModel.ViewModels;
@@ -14,7 +15,8 @@ public enum PixelValueKind
 {
     VectorExpression,
     ScalarExpression,
-    Texture
+    Texture,
+    UniformExpression
 }
 
 /// <summary>
@@ -27,6 +29,8 @@ public readonly record struct PixelValueSource(PixelValueKind Kind, int Index, i
     public static PixelValueSource Vector(int index) => new(PixelValueKind.VectorExpression, index, -1, -1);
     public static PixelValueSource Scalar(int index) => new(PixelValueKind.ScalarExpression, index, -1, -1);
     public static PixelValueSource Texture(int slot, int index, int channel) => new(PixelValueKind.Texture, index, slot, channel);
+    /// <summary>A UE5 preshader uniform expression (index into FUniformExpressionSet.UniformPreshaders).</summary>
+    public static PixelValueSource Uniform(int index) => new(PixelValueKind.UniformExpression, index, -1, -1);
 }
 
 public class PixelShaderWiring
@@ -188,6 +192,180 @@ public static class MaterialPixelShaderAnalyzer
 
         wiring.FailureReason = lastError;
         return wiring;
+    }
+
+    #endregion
+
+    #region UE5 SM6 (DXIL) analysis
+
+    /// <summary>
+    /// UE5 analysis path: the base-pass pixel shader is DXIL (SM6), retrieved from the IoStore
+    /// shared shader library. The blob keeps the same UE D3D shader-resource-table prefix as SM5,
+    /// so texture registers map through <see cref="BuildTextureRegisterMap"/> exactly as before;
+    /// only the program (DXIL, not DXBC) and the constant-buffer layout (UE5 preshader buffer with
+    /// explicit per-field offsets) differ. The Material cbuffer register is identified structurally
+    /// — it is the constant buffer whose row loads land on serialized preshader fields — so nothing
+    /// is guessed. Returns the same <see cref="PixelShaderWiring"/> the SM5 path produces.
+    /// </summary>
+    public static PixelShaderWiring AnalyzeDxil(byte[] blob, FUniformExpressionSet expressionSet, EGame game, bool usesGBuffer)
+    {
+        var wiring = new PixelShaderWiring();
+        try
+        {
+            var module = DxilModule.Parse(blob);
+            var fn = module.Functions.FirstOrDefault();
+            if (fn == null) { wiring.FailureReason = "the DXIL module has no function body"; return wiring; }
+
+            var resources = DxilTaint.BuildResources(module);
+            var handles = DxilTaint.ResolveHandles(module, fn);
+
+            var stores = fn.Instructions.Where(i => i.Callee != null && i.Callee.StartsWith("dx.op.storeOutput")).ToList();
+            if (stores.Count == 0) { wiring.FailureReason = "the DXIL pixel shader writes no output registers"; return wiring; }
+
+            var outLeaves = new Dictionary<(int Sig, int Col), List<DxLeaf>>();
+            foreach (var st in stores)
+            {
+                var sig = (int) (DxilTaint.ConstOp(fn, st, 1) ?? -1);
+                var col = (int) (DxilTaint.ConstOp(fn, st, 3) ?? -1);
+                var valId = st.Operands.Count > 4 ? st.Operands[4] : -1;
+                if (!outLeaves.TryGetValue((sig, col), out var list)) outLeaves[(sig, col)] = list = new List<DxLeaf>();
+                list.AddRange(DxilTaint.Taint(fn, resources, handles, valId, col));
+            }
+
+            // float-offset in the preshader buffer -> uniform expression index (UE5 CreateBufferStruct)
+            var offsetMap = BuildPreshaderOffsetMap(expressionSet);
+
+            // Material cbuffer register = the cb whose loads land on preshader fields (validated, not guessed)
+            var cbHit = new Dictionary<int, int>();
+            foreach (var leaf in outLeaves.Values.SelectMany(v => v).Where(l => l.Kind == "cbuffer"))
+            {
+                var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
+                if (offsetMap.ContainsKey(off)) cbHit[leaf.Register] = cbHit.GetValueOrDefault(leaf.Register) + 1;
+            }
+            var materialReg = cbHit.Count > 0 ? cbHit.OrderByDescending(k => k.Value).First().Key : -1;
+
+            // texture registers via the UE D3D shader resource table prefix (identical layout to SM5)
+            var pos = 0;
+            ReadU32(blob, ref pos);
+            var srvMap = ReadResourceMap(blob, ref pos);
+            ReadResourceMap(blob, ref pos); // sampler
+            ReadResourceMap(blob, ref pos); // uav
+            ReadResourceMap(blob, ref pos); // layout hashes
+            var textureMap = ReadResourceMap(blob, ref pos);
+            var textureByRegister = materialReg >= 0
+                ? BuildTextureRegisterMap(expressionSet, materialReg, srvMap, textureMap)
+                : new Dictionary<long, (int Slot, int Index)>();
+
+            PixelValueSource? Resolve(DxLeaf leaf)
+            {
+                if (leaf.Kind == "cbuffer" && leaf.Register == materialReg)
+                {
+                    var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
+                    if (offsetMap.TryGetValue(off, out var uni)) return PixelValueSource.Uniform(uni);
+                }
+                else if (leaf.Kind == "texture" && textureByRegister.TryGetValue(leaf.Register, out var tex))
+                {
+                    return PixelValueSource.Texture(tex.Slot, tex.Index, leaf.Component is >= 0 and <= 3 ? leaf.Component : -1);
+                }
+                return null;
+            }
+
+            void Add(string pin, PixelValueSource source)
+            {
+                if (!wiring.PinSources.TryGetValue(pin, out var l)) wiring.PinSources[pin] = l = new List<PixelValueSource>();
+                if (!l.Contains(source)) l.Add(source);
+            }
+
+            // UE deferred GBuffer layout (matches the SM5 MapSinksToPins mapping)
+            string PinFor(int sig, int col) => usesGBuffer
+                ? (sig, col) switch
+                {
+                    (1, _) => "Normal",
+                    (2, 0) => "Metallic", (2, 1) => "Specular", (2, 2) => "Roughness",
+                    (3, 3) => "Ambient Occlusion", (3, _) => "Base Color",
+                    _ => null
+                }
+                : (sig, col) switch { (0, 3) => "Opacity", (0, _) => "Emissive Color", _ => null };
+
+            foreach (var ((sig, col), leaves) in outLeaves)
+            {
+                var pin = PinFor(sig, col);
+                if (pin == null) continue;
+                foreach (var leaf in leaves)
+                    if (Resolve(leaf) is { } src) Add(pin, src);
+            }
+
+            // scene color (RT0) receives base color/metallic back through the lighting math, so only
+            // sources that reach no other pin are genuinely emissive
+            if (usesGBuffer)
+            {
+                var elsewhere = new HashSet<PixelValueSource>(wiring.PinSources.Values.SelectMany(v => v));
+                foreach (var ((sig, col), leaves) in outLeaves)
+                {
+                    if (sig != 0 || col > 2) continue;
+                    foreach (var leaf in leaves)
+                        if (Resolve(leaf) is { } src && !elsewhere.Contains(src)) Add("Emissive Color", src);
+                }
+            }
+
+            wiring.Success = wiring.PinSources.Count > 0;
+            if (!wiring.Success) wiring.FailureReason = "no serialized material value reaches an output pin";
+            wiring.ShaderTypeName = "base-pass pixel shader (SM6 DXIL)";
+        }
+        catch (Exception e)
+        {
+            wiring.FailureReason = $"DXIL analysis failed: {e.Message}";
+        }
+        return wiring;
+    }
+
+    /// <summary>
+    /// Maps each float slot of the UE5 material preshader constant buffer to the uniform expression
+    /// that writes it. Layout is FUniformExpressionSet::CreateBufferStruct / HLSLMaterialTranslator:
+    /// every UniformPreshader has one or more fields, each at an explicit BufferOffset (in floats)
+    /// spanning its component count.
+    /// </summary>
+    private static Dictionary<int, int> BuildPreshaderOffsetMap(FUniformExpressionSet es)
+    {
+        var map = new Dictionary<int, int>();
+        var fields = es.UniformPreshaderFields ?? [];
+        var preshaders = es.UniformPreshaders ?? [];
+
+        static int NumComponents(EShaderValueType t) => t switch
+        {
+            EShaderValueType.Float1 or EShaderValueType.Double1 or EShaderValueType.Int1 => 1,
+            EShaderValueType.Float2 or EShaderValueType.Double2 or EShaderValueType.Int2 => 2,
+            EShaderValueType.Float3 or EShaderValueType.Double3 or EShaderValueType.Int3 => 3,
+            EShaderValueType.Float4 or EShaderValueType.Double4 or EShaderValueType.Int4 => 4,
+            _ => 1
+        };
+
+        void Mark(int offset, int components, int uniformIndex)
+        {
+            for (var c = 0; c < components; c++) map[offset + c] = uniformIndex;
+        }
+
+        for (var i = 0; i < preshaders.Length; i++)
+        {
+            switch (preshaders[i])
+            {
+                case FMaterialUniformPreshaderHeader_5_1 h51:
+                    for (var f = 0u; f < h51.NumFields; f++)
+                    {
+                        var idx = (int) (h51.FieldIndex + f);
+                        if (idx >= fields.Length) break;
+                        Mark((int) fields[idx].BufferOffset, NumComponents(fields[idx].Type), i);
+                    }
+                    break;
+                case FMaterialUniformPreshaderHeader_5_0 h50:
+                    Mark((int) h50.BufferOffset, (int) h50.NumComponents, i);
+                    break;
+                case FMaterialUniformPreshaderHeader_5_8 h58:
+                    Mark((int) h58.BufferOffset, NumComponents(h58.Type), i);
+                    break;
+            }
+        }
+        return map;
     }
 
     #endregion

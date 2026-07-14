@@ -9,6 +9,7 @@ using CUE4Parse.UE4.Assets.Exports.Material.Editor;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
+using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
@@ -888,18 +889,32 @@ public class MaterialGraphViewModel
         // GBuffer layout ties render targets to material pins — real wiring, no guessing
         PixelShaderWiring wiring = null;
         var wiredPinCount = 0;
+        var usesGBufferPins = parameters.BlendMode is EBlendMode.BLEND_Opaque or EBlendMode.BLEND_Masked;
         if (game < EGame.GAME_UE5_0)
         {
             try
             {
-                var usesGBuffer = parameters.BlendMode is EBlendMode.BLEND_Opaque or EBlendMode.BLEND_Masked;
-                wiring = MaterialPixelShaderAnalyzer.Analyze(shaderMap, expressionSet, usesGBuffer);
+                wiring = MaterialPixelShaderAnalyzer.Analyze(shaderMap, expressionSet, usesGBufferPins);
             }
             catch (Exception e)
             {
                 wiring = new PixelShaderWiring { FailureReason = e.Message };
             }
             if (wiring.Success)
+                wiredPinCount = ApplyPixelShaderWiring(wiring, outputNode, uniformRootNodes, textureNodesBySlot);
+        }
+        else
+        {
+            // UE5: the base-pass pixel shader is SM6 DXIL living in the IoStore shared shader library
+            try
+            {
+                wiring = TryAnalyzeDxil(shaderMap, content, expressionSet, shaderMapOwner, game, usesGBufferPins);
+            }
+            catch (Exception e)
+            {
+                wiring = new PixelShaderWiring { FailureReason = e.Message };
+            }
+            if (wiring is { Success: true })
                 wiredPinCount = ApplyPixelShaderWiring(wiring, outputNode, uniformRootNodes, textureNodesBySlot);
         }
 
@@ -916,9 +931,11 @@ public class MaterialGraphViewModel
         else if (wiring is { Success: true })
             note.Append($" The compiled base-pass pixel shader ({wiring.ShaderTypeName}) was analyzed, but no serialized value reaches an output pin directly — constant inputs get folded into the shader at compile time.");
         else if (wiring != null)
-            note.Append($" Output pins are unwired: pixel shader analysis failed ({wiring.FailureReason}).");
+            note.Append(game >= EGame.GAME_UE5_0
+                ? $" Output pins are unwired: decoding the compiled SM6/DXIL base-pass pixel shader failed ({wiring.FailureReason})."
+                : $" Output pins are unwired: pixel shader analysis failed ({wiring.FailureReason}).");
         else
-            note.Append(" Output pins are unwired: recovering the wiring from the compiled GPU shader is implemented for UE4 D3D SM5 only.");
+            note.Append(" Output pins are unwired: recovering the wiring from the compiled GPU shader is implemented for D3D SM5 (DXBC) and SM6 (DXIL) only.");
         AppendShaderStageNote(note);
         if (UserGraphOnly)
             note.Append(" Showing the user-authored material graph only — the engine shader scaffolding (other shader stages and uniforms that reach no material output) is hidden.");
@@ -928,6 +945,51 @@ public class MaterialGraphViewModel
 
         ApplyInstanceOverrides(chain);
         FinalizeReconstructedGraph(layoutRoots);
+    }
+
+    /// <summary>
+    /// UE5 output-pin wiring. The base-pass pixel shader is SM6 DXIL stored in the IoStore shared
+    /// shader library; retrieve it by the shader map's ResourceHash and each candidate's in-map
+    /// index, then run the DXIL taint analysis. Candidates are every pixel shader in the map,
+    /// richest (most instructions) first — the base-pass permutation writes the whole GBuffer.
+    /// </summary>
+    private PixelShaderWiring TryAnalyzeDxil(FMaterialShaderMap shaderMap, FMaterialShaderMapContent content,
+        FUniformExpressionSet expressionSet, UMaterialInterface shaderMapOwner, EGame game, bool usesGBuffer)
+    {
+        if (shaderMap.ResourceHash is not { } resourceHash)
+            return new PixelShaderWiring { FailureReason = "the shader map does not reference the shared shader library" };
+        if (shaderMapOwner.Owner?.Provider is not IVfsFileProvider provider)
+            return new PixelShaderWiring { FailureReason = "the material provider does not expose IoStore containers" };
+
+        var candidates = new List<FShader>();
+        void Collect(FShader[] shaders)
+        {
+            foreach (var shader in shaders ?? [])
+                if (shader?.Target.Frequency == EShaderFrequency.SF_Pixel)
+                    candidates.Add(shader);
+        }
+        Collect(content.Shaders);
+        foreach (var mesh in content.OrderedMeshShaderMaps ?? [])
+            Collect(mesh.Shaders);
+        if (candidates.Count == 0)
+            return new PixelShaderWiring { FailureReason = "the shader map has no pixel shader" };
+
+        PixelShaderWiring best = null;
+        var lastError = "no base-pass pixel shader could be analyzed";
+        foreach (var shader in candidates.OrderByDescending(s => s.NumInstructions).Take(10))
+        {
+            var blob = MaterialDxilLibrary.TryGetShaderCode(provider, resourceHash, shader.ResourceIndex, out var error);
+            if (blob == null) { lastError = error ?? lastError; continue; }
+
+            PixelShaderWiring candidate;
+            try { candidate = MaterialPixelShaderAnalyzer.AnalyzeDxil(blob, expressionSet, game, usesGBuffer); }
+            catch (Exception e) { lastError = e.Message; continue; }
+
+            if (!candidate.Success) { lastError = candidate.FailureReason; continue; }
+            if (best == null || candidate.PinSources.Count > best.PinSources.Count) best = candidate;
+            if (best.PinSources.Count >= 5) break; // the base-pass PS wires the full GBuffer
+        }
+        return best ?? new PixelShaderWiring { FailureReason = lastError };
     }
 
     /// <summary>
@@ -1279,6 +1341,10 @@ public class MaterialGraphViewModel
                 case PixelValueKind.ScalarExpression:
                     if (uniformRootNodes.TryGetValue($"Scalar Expression [{sample.Index}]", out var scalarRoot))
                         endpoints.Add((scalarRoot, "Out"));
+                    break;
+                case PixelValueKind.UniformExpression:
+                    if (uniformRootNodes.TryGetValue($"Uniform Expression [{sample.Index}]", out var uniformRoot))
+                        endpoints.Add((uniformRoot, "Out"));
                     break;
                 case PixelValueKind.Texture:
                     if (!textureNodesBySlot.TryGetValue((sample.TextureSlot, sample.Index), out var textureNode))
