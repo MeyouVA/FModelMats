@@ -34,6 +34,8 @@ public partial class BlueprintGraphViewer
     private readonly Dictionary<BlueprintGraphNode, Border> _nodeBorders = new();
     private readonly Dictionary<BlueprintGraphNode, Border> _nodeShadows = new();
     private readonly Dictionary<BlueprintGraphConnection, Path> _connectionPaths = new();
+    /// <summary>Input pins that have an incoming connection this draw pass — wired data pins render filled without a value label.</summary>
+    private readonly HashSet<(BlueprintGraphNode node, string pinName)> _wiredInputPins = [];
 
     private BlueprintGraphNode _selectedNode;
     private readonly HashSet<BlueprintGraphNode> _selectedNodes = [];
@@ -171,10 +173,66 @@ public partial class BlueprintGraphViewer
             else HideSelected();
             e.Handled = true;
         }
+        else if (e.Key == Key.C && Keyboard.Modifiers.HasFlag(ModifierKeys.Control) && _selectedNodes.Count > 0)
+        {
+            CopySelectedNodes();
+            e.Handled = true;
+        }
+    }
+
+    // ---- Copy to clipboard ----
+
+    /// <summary>Copies the selected nodes' full text (title + untruncated statement), in bytecode order.</summary>
+    private void CopySelectedNodes()
+    {
+        var parts = _selectedNodes
+            .OrderBy(n => n.FunctionName, StringComparer.Ordinal)
+            .ThenBy(n => n.StatementIndex)
+            .Select(n => string.IsNullOrWhiteSpace(n.Body) ? n.Title : $"{n.Title}\n{n.Body}");
+        TrySetClipboard(string.Join("\n\n", parts));
+    }
+
+    /// <summary>Copies every text row currently shown in the properties panel.</summary>
+    private void OnCopyPanel(object sender, RoutedEventArgs e)
+    {
+        var lines = new List<string> { PropertiesTitleText.Text };
+        void Walk(DependencyObject element)
+        {
+            switch (element)
+            {
+                case TextBlock tb when !string.IsNullOrWhiteSpace(tb.Text): lines.Add(tb.Text); return;
+                case TextBox tb when !string.IsNullOrWhiteSpace(tb.Text): lines.Add(tb.Text); return;
+                case Button b when b.Content is string s: lines.Add(s); return;
+            }
+            for (var i = 0; i < VisualTreeHelper.GetChildrenCount(element); i++)
+                Walk(VisualTreeHelper.GetChild(element, i));
+        }
+        Walk(PropertiesPanel);
+        TrySetClipboard(string.Join("\n", lines));
+    }
+
+    private static void TrySetClipboard(string text)
+    {
+        try
+        {
+            Clipboard.SetDataObject(text ?? string.Empty, true);
+        }
+        catch
+        {
+            // the Win32 clipboard can be transiently locked by another process; nothing useful to do
+        }
     }
 
     private void OnHideSelectedClicked(object sender, RoutedEventArgs e) => HideSelected();
     private void OnUnhideAllClicked(object sender, RoutedEventArgs e) => UnhideAll();
+
+    private void OnShowCodeToggled(object sender, RoutedEventArgs e)
+    {
+        if (_canvas == null) return;
+        _viewModel.SetStatementTextVisible(ShowCodeToggle.IsChecked == true);
+        Redraw();
+        FitToView();
+    }
 
     private void HideSelected()
     {
@@ -220,6 +278,11 @@ public partial class BlueprintGraphViewer
         _nodeShadows.Clear();
         _connectionPaths.Clear();
 
+        _wiredInputPins.Clear();
+        foreach (var connection in _viewModel.Connections)
+            if (IsNodeVisible(connection.SourceNode) && IsNodeVisible(connection.TargetNode))
+                _wiredInputPins.Add((connection.TargetNode, connection.TargetPinName));
+
         foreach (var node in _viewModel.Nodes)
             if (IsNodeVisible(node))
                 ComputeNodeGeometry(node);
@@ -238,10 +301,12 @@ public partial class BlueprintGraphViewer
         var height = node.Height;
         _nodeSizes[node] = (NodeWidth, height);
 
-        // exec-in and the first exec-out share the first pin row, so flow reads straight across
+        // exec-in and the first exec-out share the first pin row, so flow reads straight across;
+        // data pins stack in the rows below on their own side
         var firstPinY = node.NodePosY + HeaderHeight + BodyTopPad + PinRowHeight / 2;
-        if (node.InputPins.Count > 0)
-            _pinPositions[(node, node.InputPins[0].Name, false)] = new Point(node.NodePosX, firstPinY);
+        for (var i = 0; i < node.InputPins.Count; i++)
+            _pinPositions[(node, node.InputPins[i].Name, false)] =
+                new Point(node.NodePosX, firstPinY + i * PinRowHeight);
 
         for (var i = 0; i < node.OutputPins.Count; i++)
             _pinPositions[(node, node.OutputPins[i].Name, true)] =
@@ -255,11 +320,12 @@ public partial class BlueprintGraphViewer
             return;
 
         var color = GetEdgeColor(connection.Kind);
+        var isData = connection.Kind == EBlueprintEdgeKind.Data;
         var path = new Path
         {
             Data = BuildConnectionGeometry(start, end),
-            Stroke = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B)),
-            StrokeThickness = 2.4,
+            Stroke = new SolidColorBrush(Color.FromArgb(isData ? (byte)185 : (byte)210, color.R, color.G, color.B)),
+            StrokeThickness = isData ? 1.7 : 2.4,
             IsHitTestVisible = false
         };
         // back-edges (jumps upward) read better dashed so they don't look like normal flow
@@ -357,7 +423,7 @@ public partial class BlueprintGraphViewer
         };
         Grid.SetColumn(title, 0);
         headerGrid.Children.Add(title);
-        if (node.StatementIndex >= 0)
+        if (node.StatementIndex >= 0 && node.Kind != EBlueprintNodeKind.VariableGet) // Gets borrow their consumer's index for layout only
         {
             var offset = new TextBlock
             {
@@ -372,7 +438,9 @@ public partial class BlueprintGraphViewer
         header.Child = headerGrid;
         content.Children.Add(header);
 
-        // body text (truncated to the reserved line count; full text lives in the panel)
+        var pinRows = Math.Max(Math.Max(node.InputPins.Count, node.OutputPins.Count), 1);
+
+        // body text below the pin rows (truncated to the reserved line count; full text lives in the panel)
         if (!string.IsNullOrEmpty(node.Body) && node.BodyLineCount > 0)
         {
             var body = new TextBlock
@@ -383,20 +451,30 @@ public partial class BlueprintGraphViewer
                 FontFamily = new FontFamily("Consolas"),
                 TextWrapping = TextWrapping.Wrap,
                 TextTrimming = TextTrimming.CharacterEllipsis,
-                Width = width - 26 - (node.OutputPins.Count > 0 ? 44 : 0),
+                Width = width - 26,
                 MaxHeight = node.BodyLineCount * BodyLineHeight + 2
             };
             Canvas.SetLeft(body, 14);
-            Canvas.SetTop(body, HeaderHeight + BodyTopPad);
+            Canvas.SetTop(body, HeaderHeight + BodyTopPad + pinRows * PinRowHeight);
             content.Children.Add(body);
         }
 
-        // exec pins as white triangles, Blueprint style
+        // exec pins as white triangles, data pins as circles — Blueprint style. When both sides
+        // have a pin on the same row, each side's label gets a budget so they can never overlap.
         var firstPinY = HeaderHeight + BodyTopPad + PinRowHeight / 2;
-        if (node.InputPins.Count > 0)
-            AddExecPin(content, node.InputPins[0], isOutput: false, width, firstPinY);
+        for (var i = 0; i < node.InputPins.Count; i++)
+        {
+            var shared = i < node.OutputPins.Count;
+            AddNodePin(content, node.InputPins[i], isOutput: false, width, firstPinY + i * PinRowHeight,
+                _wiredInputPins.Contains((node, node.InputPins[i].Name)),
+                shared ? width * 0.55 - 14 : width - 20);
+        }
         for (var i = 0; i < node.OutputPins.Count; i++)
-            AddExecPin(content, node.OutputPins[i], isOutput: true, width, firstPinY + i * PinRowHeight);
+        {
+            var shared = i < node.InputPins.Count;
+            AddNodePin(content, node.OutputPins[i], isOutput: true, width, firstPinY + i * PinRowHeight, wired: true,
+                shared ? width * 0.45 - 14 : width - 20);
+        }
 
         border.Child = content;
         Canvas.SetLeft(border, node.NodePosX);
@@ -406,10 +484,47 @@ public partial class BlueprintGraphViewer
         _nodeBorders[node] = border;
     }
 
-    /// <summary>Draws one exec pin as a right-pointing triangle at the node edge, with a small label for named branches.</summary>
-    private static void AddExecPin(Canvas content, BlueprintGraphPin pin, bool isOutput, double width, double cy)
+    /// <summary>
+    /// Draws one pin at the node edge: exec pins as right-pointing triangles, data pins as circles
+    /// (filled when wired, hollow when the value is a literal shown in the label). Data pins are
+    /// labelled on their own side; unwired data inputs also show the decoded argument.
+    /// </summary>
+    private static void AddNodePin(Canvas content, BlueprintGraphPin pin, bool isOutput, double width, double cy, bool wired,
+        double maxLabelWidth)
     {
-        var connected = GetEdgeColor(pin.Kind);
+        var kindColor = GetEdgeColor(pin.Kind);
+        if (pin.IsData)
+        {
+            var circle = new Ellipse
+            {
+                Width = 9,
+                Height = 9,
+                Stroke = new SolidColorBrush(kindColor),
+                StrokeThickness = 1.4,
+                Fill = wired ? new SolidColorBrush(kindColor) : Brushes.Transparent
+            };
+            Canvas.SetLeft(circle, isOutput ? width - 4.5 : -4.5);
+            Canvas.SetTop(circle, cy - 4.5);
+            content.Children.Add(circle);
+
+            var text = pin.Name;
+            if (!isOutput && !wired && !string.IsNullOrEmpty(pin.Label) && pin.Label != pin.Name)
+                text = $"{pin.Name} = {pin.Label}";
+            var dataLabel = new TextBlock
+            {
+                Text = text,
+                Foreground = new SolidColorBrush(Color.FromArgb(230, kindColor.R, kindColor.G, kindColor.B)),
+                FontSize = 9,
+                MaxWidth = maxLabelWidth,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            dataLabel.Measure(new Size(maxLabelWidth, double.PositiveInfinity));
+            Canvas.SetLeft(dataLabel, isOutput ? width - 8 - dataLabel.DesiredSize.Width : 8);
+            Canvas.SetTop(dataLabel, cy - dataLabel.DesiredSize.Height / 2);
+            content.Children.Add(dataLabel);
+            return;
+        }
+
         var tri = new Polygon
         {
             Points = [new Point(0, 0), new Point(9, 5), new Point(0, 10)],
@@ -427,7 +542,7 @@ public partial class BlueprintGraphViewer
             var label = new TextBlock
             {
                 Text = pin.Name,
-                Foreground = new SolidColorBrush(connected),
+                Foreground = new SolidColorBrush(kindColor),
                 FontSize = 9,
                 FontWeight = FontWeights.SemiBold
             };
@@ -609,12 +724,14 @@ public partial class BlueprintGraphViewer
     private static string NodeKindExplanation(BlueprintGraphNode node) => node.Kind switch
     {
         EBlueprintNodeKind.FunctionHeader => "Function entry. Execution of this function begins here and flows into the first statement.",
-        EBlueprintNodeKind.Branch => "Conditional branch (JumpIfNot). Takes the True pin when the condition holds, otherwise jumps to the False target.",
+        EBlueprintNodeKind.Branch => "Conditional branch (JumpIfNot). Takes the True pin when the condition holds, otherwise jumps to the False target. Recognized Switch nodes are collapsed compare/branch chains.",
+        EBlueprintNodeKind.Cast => "Cast To X. Collapsed from the exact statement sequence the compiler emits for a cast node (cast, bool check, branch); Then = success, Cast Failed = the branch target.",
         EBlueprintNodeKind.Jump => "Unconditional jump. Control transfers to the target statement; this is a compiled goto, not an authored node.",
         EBlueprintNodeKind.Flow => "Execution-flow control. Push/Pop manage the VM's flow stack for latent actions and sequence continuations.",
         EBlueprintNodeKind.Return => "Return. Ends this function's execution.",
         EBlueprintNodeKind.Call => "Function call. A Call pin (if present) dispatches into another function's bytecode, e.g. the event graph's ubergraph.",
         EBlueprintNodeKind.Assign => "Assignment. Writes the evaluated right-hand expression into the target variable/property.",
+        EBlueprintNodeKind.VariableGet => "Variable read. The consuming statement's bytecode argument is this variable token; it is shown as an editor-style Get node feeding the pin.",
         _ => null
     };
 
@@ -627,6 +744,45 @@ public partial class BlueprintGraphViewer
 
         foreach (var (key, value) in _viewModel.ClassInfo)
             AddPropertyRow(key, value);
+
+        if (_viewModel.Variables.Count > 0)
+        {
+            PropertiesPanel.Children.Add(new TextBlock
+            {
+                Text = $"Variables ({_viewModel.Variables.Count})",
+                FontWeight = FontWeights.SemiBold,
+                FontSize = 12,
+                Margin = new Thickness(0, 10, 0, 4)
+            });
+            foreach (var variable in _viewModel.Variables)
+            {
+                var value = variable.DefaultValue == null
+                    ? variable.Type
+                    : $"{variable.Type} = {variable.DefaultValue}";
+                AddPropertyRow(variable.Name, value, $"Flags: {variable.Flags}");
+            }
+        }
+
+        if (_viewModel.Components.Count > 0)
+        {
+            PropertiesPanel.Children.Add(new TextBlock
+            {
+                Text = $"Components ({_viewModel.Components.Count})",
+                FontWeight = FontWeights.SemiBold,
+                FontSize = 12,
+                Margin = new Thickness(0, 10, 0, 2)
+            });
+            PropertiesPanel.Children.Add(new TextBlock
+            {
+                Text = "From the cooked construction script — hierarchy as spawned. Hover a row for the template's serialized properties.",
+                FontSize = 10,
+                Opacity = 0.6,
+                Margin = new Thickness(0, 0, 0, 4),
+                TextWrapping = TextWrapping.Wrap
+            });
+            foreach (var component in _viewModel.Components)
+                AddComponentRow(component);
+        }
 
         if (_viewModel.Functions.Count == 0) return;
 
@@ -662,9 +818,45 @@ public partial class BlueprintGraphViewer
         }
     }
 
-    private void AddPropertyRow(string key, string value)
+    /// <summary>One row of the Components tree: indented by depth, "Name (Class)" + asset/attachment line, template properties in the tooltip.</summary>
+    private void AddComponentRow(BlueprintComponentInfo component)
+    {
+        var row = new StackPanel { Margin = new Thickness(component.Depth * 14, 1, 0, 1) };
+
+        var headerLine = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis };
+        headerLine.Inlines.Add(new System.Windows.Documents.Run(component.Depth > 0 ? "└ " : "")
+            { Foreground = new SolidColorBrush(Color.FromArgb(120, 255, 255, 255)) });
+        headerLine.Inlines.Add(new System.Windows.Documents.Run(component.Name)
+            { FontWeight = FontWeights.SemiBold, FontSize = 11 });
+        headerLine.Inlines.Add(new System.Windows.Documents.Run($"  ({component.Class})")
+            { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(120, 190, 140)) });
+        if (component.InheritedFrom != null)
+            headerLine.Inlines.Add(new System.Windows.Documents.Run($"  inherited: {component.InheritedFrom}")
+                { FontSize = 9, Foreground = new SolidColorBrush(Color.FromArgb(150, 200, 180, 90)) });
+        row.Children.Add(headerLine);
+
+        var detail = string.Join("   ",
+            new[] { component.Asset, component.AttachInfo }.Where(s => !string.IsNullOrEmpty(s)));
+        if (detail.Length > 0)
+            row.Children.Add(new TextBlock
+            {
+                Text = detail,
+                FontSize = 10,
+                Opacity = 0.7,
+                Margin = new Thickness(12, 0, 0, 0),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+
+        if (component.TemplateProperties.Count > 0)
+            row.ToolTip = string.Join("\n", component.TemplateProperties.Select(p => $"{p.Key} = {p.Value}"));
+
+        PropertiesPanel.Children.Add(row);
+    }
+
+    private void AddPropertyRow(string key, string value, string toolTip = null)
     {
         var panel = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
+        if (toolTip != null) panel.ToolTip = toolTip;
         panel.Children.Add(new TextBlock
         {
             Text = key,
@@ -697,7 +889,18 @@ public partial class BlueprintGraphViewer
         }
         else
         {
-            panel.Children.Add(new TextBlock { Text = value, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            // read-only borderless TextBox so every value in the panel can be selected and copied
+            panel.Children.Add(new TextBox
+            {
+                Text = value,
+                IsReadOnly = true,
+                IsReadOnlyCaretVisible = false,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Padding = new Thickness(0),
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap
+            });
         }
         PropertiesPanel.Children.Add(panel);
     }
@@ -888,6 +1091,7 @@ public partial class BlueprintGraphViewer
         EBlueprintEdgeKind.Jump => Color.FromRgb(240, 150, 60),
         EBlueprintEdgeKind.Push => Color.FromRgb(180, 120, 220),
         EBlueprintEdgeKind.Call => Color.FromRgb(90, 150, 230),
+        EBlueprintEdgeKind.Data => Color.FromRgb(96, 196, 208),
         _ => Color.FromRgb(205, 205, 205),
     };
 
@@ -895,11 +1099,13 @@ public partial class BlueprintGraphViewer
     {
         EBlueprintNodeKind.FunctionHeader => Color.FromRgb(30, 120, 90),
         EBlueprintNodeKind.Branch => Color.FromRgb(180, 120, 40),
+        EBlueprintNodeKind.Cast => Color.FromRgb(35, 120, 130),
         EBlueprintNodeKind.Jump => Color.FromRgb(170, 90, 40),
         EBlueprintNodeKind.Flow => Color.FromRgb(110, 70, 160),
         EBlueprintNodeKind.Return => Color.FromRgb(160, 50, 50),
         EBlueprintNodeKind.Call => Color.FromRgb(50, 90, 170),
         EBlueprintNodeKind.Assign => Color.FromRgb(40, 110, 80),
+        EBlueprintNodeKind.VariableGet => Color.FromRgb(70, 130, 85),
         _ => Color.FromRgb(72, 72, 82),
     };
 }

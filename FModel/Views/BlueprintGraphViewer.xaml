@@ -34,6 +34,8 @@
                 <Button Content="Reset Zoom" MinWidth="78" Margin="4 0" Click="OnResetZoom"/>
                 <Button x:Name="DetailsButton" Content="Blueprint Details" MinWidth="110" Margin="12 0 4 0" Click="OnShowDetails"
                         ToolTip="Show the class, parent and the list of decompiled functions"/>
+                <ToggleButton x:Name="ShowCodeToggle" Content="Show Code" MinWidth="82" Margin="4 0" Click="OnShowCodeToggled"
+                              ToolTip="Show the decompiled statement text on the nodes. Off = compact editor-style nodes; the statement is always available in the properties panel."/>
 
                 <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
 
@@ -80,7 +82,15 @@
 
                     <Border Grid.Row="0" Padding="8 6"
                             Background="{DynamicResource {x:Static adonisUi:Brushes.Layer2BackgroundBrush}}">
-                        <TextBlock x:Name="PropertiesTitleText" Text="Properties" FontWeight="SemiBold" FontSize="13"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="PropertiesTitleText" Text="Properties" FontWeight="SemiBold" FontSize="13" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Content="Copy" MinWidth="50" Padding="6 1" Click="OnCopyPanel"
+                                    ToolTip="Copy everything shown in this panel to the clipboard"/>
+                        </Grid>
                     </Border>
 
                     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
@@ -99,7 +109,7 @@
                 <TextBlock x:Name="ClassChainText" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="SelectedNodeText" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="HiddenCountText" VerticalAlignment="Center" Margin="0 0 16 0" Opacity="0.7"/>
-                <TextBlock Text="LMB drag: select / move  •  Shift+click: add  •  RMB/MMB drag: pan  •  Wheel: zoom  •  H: hide sel.  •  Alt+H: unhide all"
+                <TextBlock Text="LMB drag: select / move  •  Shift+click: add  •  RMB/MMB drag: pan  •  Wheel: zoom  •  H: hide sel.  •  Alt+H: unhide all  •  Ctrl+C: copy sel. node text"
                            VerticalAlignment="Center" Opacity="0.55"/>
             </StackPanel>
         </Border>

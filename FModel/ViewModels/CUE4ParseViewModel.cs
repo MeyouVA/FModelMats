@@ -1652,14 +1652,13 @@ public class CUE4ParseViewModel : ViewModel
             var exports = package.GetExports().ToList();
 
             var classExport = exports.OfType<UClass>().FirstOrDefault();
-            // draw every function that actually carries compiled bytecode, in export order
-            var functions = exports.OfType<UFunction>()
-                .Where(f => f.ScriptBytecode is { Length: > 0 })
-                .ToList();
+            // draw every function, in export order — bytecode-less ones (delegate signatures, event
+            // stubs) still get a header node showing their declared inputs/outputs
+            var functions = exports.OfType<UFunction>().ToList();
 
             if (functions.Count == 0)
             {
-                FLogger.Append(ELog.Warning, () => FLogger.Text($"No Blueprint bytecode found in '{entry.Name}'", Constants.WHITE, true));
+                FLogger.Append(ELog.Warning, () => FLogger.Text($"No Blueprint functions found in '{entry.Name}'", Constants.WHITE, true));
                 return;
             }
 
