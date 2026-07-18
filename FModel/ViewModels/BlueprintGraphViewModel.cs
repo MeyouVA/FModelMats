@@ -23,6 +23,8 @@ public enum EBlueprintNodeKind
     Flow,
     Return,
     Call,
+    /// <summary>A call to a proven BlueprintPure function — rendered editor-style with no exec pins, connected only by value wires.</summary>
+    PureCall,
     Assign,
     /// <summary>A variable read shown as its own editor-style Get node (the read token is in the bytecode argument).</summary>
     VariableGet,
@@ -98,6 +100,17 @@ public class BlueprintFunctionInfo
     public readonly HashSet<BlueprintGraphNode> Nodes = [];
 }
 
+/// <summary>Which list of the cooked class a component row came from (drives the panel's grouping).</summary>
+public enum EBlueprintComponentKind
+{
+    /// <summary>A SimpleConstructionScript node — part of the spawned actor's component tree.</summary>
+    SceneTree,
+    /// <summary>A template for a component the graphs add at runtime (AddComponent node).</summary>
+    Runtime,
+    /// <summary>A timeline template.</summary>
+    Timeline,
+}
+
 /// <summary>
 /// One component of the Blueprint's Components tree. Cooked assets keep the full
 /// SimpleConstructionScript (it runs when the actor spawns), so name, class, hierarchy,
@@ -105,6 +118,7 @@ public class BlueprintFunctionInfo
 /// </summary>
 public class BlueprintComponentInfo
 {
+    public EBlueprintComponentKind Kind { get; set; } = EBlueprintComponentKind.SceneTree;
     public string Name { get; set; } = string.Empty;
     public string Class { get; set; } = string.Empty;
     /// <summary>The main content asset on the template (static/skeletal mesh, sound, particle system…), when one is set.</summary>
@@ -181,6 +195,9 @@ public class BlueprintGraphViewModel
 
     // kept so the pattern pass can re-inspect each node's decoded statement after all edges exist
     private readonly Dictionary<BlueprintGraphNode, KismetExpression> _stmtByNode = new();
+    // this package's own functions by name (purity of local virtual calls is read off their real flags)
+    private readonly Dictionary<string, UFunction> _functionByName = new(StringComparer.Ordinal);
+    private UClass _classExport;
     private readonly Dictionary<BlueprintFunctionInfo, List<(string Var, BlueprintGraphNode Node, string Pin)>> _writesByFunc = new();
     private readonly Dictionary<BlueprintFunctionInfo, List<(BlueprintGraphNode Node, string Pin, string Var, string Token)>> _readsByFunc = new();
 
@@ -190,7 +207,7 @@ public class BlueprintGraphViewModel
     /// </summary>
     public static BlueprintGraphViewModel Build(string packageName, UClass classExport, IReadOnlyList<UFunction> functions)
     {
-        var vm = new BlueprintGraphViewModel { PackageName = packageName };
+        var vm = new BlueprintGraphViewModel { PackageName = packageName, _classExport = classExport };
 
         if (classExport != null)
         {
@@ -223,14 +240,17 @@ public class BlueprintGraphViewModel
             });
         }
 
-        // with every exec/call edge in place: collapse compiler idioms back into their editor
-        // nodes, then wire value flow, then lay the bands out
+        // event stubs collapse into the ubergraph so each event shows as its own graph, then:
+        // collapse compiler idioms back into their editor nodes, wire value flow, detach proven
+        // pure calls from the exec chain, and lay the bands out
+        vm.MergeEventStubs(classExport);
         foreach (var fn in vm.Functions)
             vm.CollapsePatterns(fn);
         double bandY = 0;
         foreach (var fn in vm.Functions)
         {
             var wired = vm.WireDataFlow(fn.Nodes, vm._writesByFunc[fn], vm._readsByFunc[fn]);
+            vm.DetachPureCalls(fn);
             vm.CreateGetNodes(fn, vm._readsByFunc[fn], wired);
             var height = vm.LayoutBand(fn.Nodes, bandY);
             bandY += height + BandGap;
@@ -244,6 +264,7 @@ public class BlueprintGraphViewModel
     {
         BlueprintDecompilerUtils.Function = function;
         var funcName = function.Name;
+        _functionByName[funcName] = function;
 
         // parameters are serialized properties on the UFunction itself (CPF_Parm flags) — real data, both
         // the FField path (4.25+) and the legacy UProperty-export path resolve here
@@ -396,6 +417,14 @@ public class BlueprintGraphViewModel
         // keep statements only reachable via back-edges out of the header's column
         foreach (var n in nodes)
             if (n.StatementIndex >= 0 && col[n] == 0) col[n] = 1;
+
+        // pure calls carry no exec flow either: place each one column left of its nearest consumer
+        // (descending statement order so chained pure calls cascade leftwards)
+        foreach (var n in nodes.Where(n => n.Kind == EBlueprintNodeKind.PureCall).OrderByDescending(n => n.StatementIndex))
+        {
+            var consumers = outEdges[n].Where(t => t != n).ToList();
+            if (consumers.Count > 0) col[n] = Math.Max(0, consumers.Min(c => col[c]) - 1);
+        }
 
         // Get nodes sit one column left of the node they feed (they carry no exec flow of their own)
         foreach (var n in nodes)
@@ -583,7 +612,7 @@ public class BlueprintGraphViewModel
                     AddCallInputs(node, finalFn.StackNode, finalFn.Parameters, reads);
                     break;
                 case EX_VirtualFunction virtualFn:
-                    AddCallInputs(node, null, virtualFn.Parameters, reads);
+                    AddCallInputs(node, null, virtualFn.Parameters, reads, ShortName(virtualFn.VirtualFunctionName.Text));
                     break;
                 case EX_CallMulticastDelegate multicast:
                     AddDataInput(node, "Delegate", multicast.Delegate, reads);
@@ -790,7 +819,7 @@ public class BlueprintGraphViewModel
         if (castVar == null) return false;
 
         var n1 = ExecTarget(n0, "Then");
-        if (n1 == null || n1.FunctionName != n0.FunctionName || !OnlyEnteredFrom(n1, n0)) return false;
+        if (n1 == null || !info.Nodes.Contains(n1) || !OnlyEnteredFrom(n1, n0)) return false;
         if (_stmtByNode.GetValueOrDefault(n1) is not EX_Let let1
             || let1.Assignment is not EX_Cast toBool
             || toBool.ConversionType is not (ECastToken.CST_ObjectToBool or ECastToken.CST_InterfaceToBool
@@ -806,7 +835,7 @@ public class BlueprintGraphViewModel
         var execPins = new List<BlueprintGraphPin>();
 
         var n2 = ExecTarget(n1, "Then");
-        var impure = n2 != null && n2.FunctionName == n0.FunctionName
+        var impure = n2 != null && info.Nodes.Contains(n2)
             && _stmtByNode.GetValueOrDefault(n2) is EX_JumpIfNot branch
             && VarName(branch.BooleanExpression) == boolVar
             && OnlyEnteredFrom(n2, n1);
@@ -815,7 +844,7 @@ public class BlueprintGraphViewModel
             group.Add(n2);
             // success path: fall-through, or one absorbed EX_Jump the peephole left behind
             var success = ExecTarget(n2, "True");
-            if (success != null && success.FunctionName == n0.FunctionName
+            if (success != null && info.Nodes.Contains(success)
                 && _stmtByNode.GetValueOrDefault(success) is EX_Jump && OnlyEnteredFrom(success, n2)
                 && NoCallPins([success]))
             {
@@ -872,8 +901,11 @@ public class BlueprintGraphViewModel
 
         // the first statement of any flow-stack function is the compiler's own return-address push
         // (FScriptBuilderBase::PushReturnAddress, emitted before any node's statements) — it is not
-        // a Sequence node, so label it for what it is and leave it alone
-        if (Connections.Any(c => c.Kind == EBlueprintEdgeKind.Entry && c.TargetNode == n0))
+        // a Sequence node, so label it for what it is and leave it alone. Only the function's OWN
+        // header counts: after the ubergraph split, event headers also carry Entry edges, and a
+        // push right at an event's entry point IS a real Sequence.
+        if (Connections.Any(c => c.Kind == EBlueprintEdgeKind.Entry && c.TargetNode == n0
+                                 && c.SourceNode.FunctionName == n0.FunctionName))
         {
             if (n0.Title == "Push Flow")
             {
@@ -887,7 +919,7 @@ public class BlueprintGraphViewModel
         var group = new List<BlueprintGraphNode> { n0 };
         var cur = n0;
         while (ExecTarget(cur, "Then") is { } next
-               && next.FunctionName == n0.FunctionName
+               && info.Nodes.Contains(next)
                && _stmtByNode.GetValueOrDefault(next) is EX_PushExecutionFlow
                && OnlyEnteredFrom(next, cur))
         {
@@ -900,7 +932,7 @@ public class BlueprintGraphViewModel
         var last = group[^1];
         var then0Target = ExecTarget(last, "Then");
         if (then0Target == null) return false;
-        if (then0Target.FunctionName == n0.FunctionName
+        if (info.Nodes.Contains(then0Target)
             && _stmtByNode.GetValueOrDefault(then0Target) is EX_Jump
             && OnlyEnteredFrom(then0Target, last) && NoCallPins([then0Target]))
         {
@@ -951,7 +983,7 @@ public class BlueprintGraphViewModel
         KismetExpression selection = null;
         BlueprintGraphNode cur = head, prev = null;
 
-        while (cur != null && cur.FunctionName == head.FunctionName)
+        while (cur != null && info.Nodes.Contains(cur))
         {
             if (_stmtByNode.GetValueOrDefault(cur) is not EX_Let letN
                 || letN.Assignment is not EX_FinalFunction cmp || cmp.StackNode == null
@@ -967,7 +999,7 @@ public class BlueprintGraphViewModel
             if (pairs.Count > 0 && !OnlyEnteredFrom(cur, prev)) break;
 
             var jumpNode = ExecTarget(cur, "Then");
-            if (jumpNode == null || jumpNode.FunctionName != head.FunctionName
+            if (jumpNode == null || !info.Nodes.Contains(jumpNode)
                 || _stmtByNode.GetValueOrDefault(jumpNode) is not EX_JumpIfNot cond
                 || VarName(cond.BooleanExpression) != boolVar
                 || !OnlyEnteredFrom(jumpNode, cur))
@@ -986,7 +1018,7 @@ public class BlueprintGraphViewModel
         // default path: fall-through from the last comparison, or one absorbed trailing EX_Jump
         var defaultTarget = ExecTarget(lastJump, "True");
         if (defaultTarget == null) return false;
-        if (defaultTarget.FunctionName == head.FunctionName
+        if (info.Nodes.Contains(defaultTarget)
             && _stmtByNode.GetValueOrDefault(defaultTarget) is EX_Jump
             && OnlyEnteredFrom(defaultTarget, lastJump) && NoCallPins([defaultTarget]))
         {
@@ -1105,20 +1137,334 @@ public class BlueprintGraphViewModel
             node.OutputPins.Any(p => p.Name.Contains(name));
     }
 
+    // ────────────────────────────────────────────────────────────────────────────────────────
+    // Ubergraph split. The compiler collapses every event graph into one ExecuteUbergraph
+    // function; each event becomes a tiny stub that copies its parameters onto the ubergraph's
+    // persistent frame and dispatches to a literal entry offset. Merging the stubs back and
+    // partitioning the ubergraph by entry offset restores the editor's view: one graph per event,
+    // with the event node providing its parameters. Statements are laid down contiguously per
+    // entry, and any exec edge that does cross a partition boundary is still drawn — the split
+    // only regroups the display, it never hides or invents flow.
+    // ────────────────────────────────────────────────────────────────────────────────────────
+
+    private void MergeEventStubs(UClass classExport)
+    {
+        // the class itself names its event graph function; the name prefix is the compiler's convention
+        var uberNames = new HashSet<string>();
+        if (classExport is UBlueprintGeneratedClass { UberGraphFunction: { IsNull: false } ug })
+            uberNames.Add(ug.Name);
+        foreach (var fn in Functions)
+            if (fn.Name.StartsWith("ExecuteUbergraph_", StringComparison.Ordinal))
+                uberNames.Add(fn.Name);
+        foreach (var uberName in uberNames)
+            if (Functions.FirstOrDefault(f => f.Name == uberName) is { } uber)
+                SplitUbergraph(uber);
+    }
+
+    private void SplitUbergraph(BlueprintFunctionInfo uber)
+    {
+        var uberWrites = _writesByFunc[uber];
+        var uberReads = _readsByFunc[uber];
+        var merged = new List<(int Entry, BlueprintGraphNode Header, string StubName, string Signature)>();
+
+        foreach (var stub in Functions.Where(f => f != uber).ToList())
+        {
+            var stmts = stub.Nodes.Where(n => n.StatementIndex >= 0).OrderBy(n => n.StatementIndex).ToList();
+            if (stmts.Count == 0) continue;
+            var header = stub.Nodes.FirstOrDefault(n => n.Kind == EBlueprintNodeKind.FunctionHeader);
+            if (header == null) continue;
+
+            // exact stub shape: [param → ubergraph-frame copies]*, one dispatch call into this
+            // ubergraph, then only Return / End of Script — anything else is a real function
+            var copies = new List<(string FrameVar, string Param)>();
+            BlueprintGraphConnection callEdge = null;
+            var ok = true;
+            foreach (var n in stmts)
+            {
+                var s = _stmtByNode.GetValueOrDefault(n);
+                if (callEdge == null)
+                {
+                    switch (s)
+                    {
+                        case EX_LetValueOnPersistentFrame frame
+                            when frame.DestinationProperty?.ToString() is { } dest && VarName(frame.AssignmentExpression) is { } src:
+                            copies.Add((dest, src));
+                            continue;
+                        case EX_Let let
+                            when let.Assignment is EX_VariableBase
+                                 && ((let.Variable as EX_VariableBase)?.Variable?.ToString() ?? let.Property?.ToString()) is { } dest:
+                            copies.Add((dest, VarName(let.Assignment)));
+                            continue;
+                    }
+                    if (s != null && FindCallOffsets(s).Any(co => co.TargetFunc == uber.Name)
+                        && Connections.FirstOrDefault(c => c.SourceNode == n && c.Kind == EBlueprintEdgeKind.Call
+                                                           && uber.Nodes.Contains(c.TargetNode)) is { } edge)
+                    {
+                        callEdge = edge;
+                        continue;
+                    }
+                }
+                else if (s is EX_Return or EX_EndOfScript) continue;
+                ok = false;
+                break;
+            }
+            if (!ok || callEdge == null) continue;
+            // every copied value must be one of the event's own declared parameters (a header pin)
+            if (!copies.All(c => header.OutputPins.Any(p => p.IsData && p.Name == c.Param))) continue;
+
+            var entry = callEdge.TargetNode;
+            var removed = new HashSet<BlueprintGraphNode>(stmts);
+            Connections.RemoveAll(c => removed.Contains(c.SourceNode) || removed.Contains(c.TargetNode));
+            foreach (var n in stmts)
+            {
+                Nodes.Remove(n);
+                _stmtByNode.Remove(n);
+            }
+            Functions.Remove(stub);
+            _writesByFunc.Remove(stub);
+            _readsByFunc.Remove(stub);
+
+            // the event's parameters land on the ubergraph frame: the header pin (named like the
+            // parameter) now provides each frame variable, so reads inside the event wire back to it
+            foreach (var (frameVar, param) in copies)
+                uberWrites.Add((frameVar, header, param));
+
+            Connections.Add(new BlueprintGraphConnection
+            {
+                SourceNode = header, SourcePinName = "Entry",
+                TargetNode = entry, Kind = EBlueprintEdgeKind.Entry,
+            });
+            header.DisplayProperties.Add(new("Event Graph",
+                $"Stub merged: the compiled event copied its parameters onto the ubergraph frame and dispatched to offset 0x{entry.StatementIndex:X}"));
+            uber.Nodes.Add(header);
+            merged.Add((entry.StatementIndex, header, stub.Name, stub.Signature));
+        }
+        if (merged.Count == 0) return;
+
+        // partition by entry offset — the backend lays each event's statements down contiguously,
+        // so [entry, next entry) is that event's code. Everything before the first entry is the
+        // dispatcher prologue; the pushed return address onwards is the shared tail.
+        var stmtsAll = uber.Nodes.Where(n => n.StatementIndex >= 0).OrderBy(n => n.StatementIndex).ToList();
+        var firstEntry = merged.Min(m => m.Entry);
+        var lastEntry = merged.Max(m => m.Entry);
+        var tailStart = int.MaxValue;
+        if (stmtsAll.Count > 0 && _stmtByNode.GetValueOrDefault(stmtsAll[0]) is EX_PushExecutionFlow
+            && ExecTarget(stmtsAll[0], "Push") is { } returnNode && returnNode.StatementIndex > lastEntry)
+            tailStart = returnNode.StatementIndex;
+
+        var entryOffsets = merged.Select(m => m.Entry).Distinct().OrderBy(x => x).ToList();
+        var newInfos = new List<BlueprintFunctionInfo>();
+        for (var i = 0; i < entryOffsets.Count; i++)
+        {
+            var entry = entryOffsets[i];
+            var end = i + 1 < entryOffsets.Count ? entryOffsets[i + 1] : tailStart;
+            var events = merged.Where(m => m.Entry == entry).ToList(); // two events can share one entry
+            var info = new BlueprintFunctionInfo
+            {
+                Name = string.Join(" / ", events.Select(ev => ev.StubName)),
+                Signature = events[0].Signature,
+            };
+            foreach (var ev in events) info.Nodes.Add(ev.Header);
+            foreach (var n in stmtsAll.Where(n => n.StatementIndex >= entry && n.StatementIndex < end))
+                info.Nodes.Add(n);
+            info.StatementCount = info.Nodes.Count(n => n.StatementIndex >= 0);
+            newInfos.Add(info);
+        }
+
+        var moved = new HashSet<BlueprintGraphNode>(newInfos.SelectMany(ni => ni.Nodes));
+        uber.Nodes.RemoveWhere(moved.Contains);
+        uber.StatementCount = uber.Nodes.Count(n => n.StatementIndex >= 0);
+        uber.Name += " (dispatcher)";
+
+        foreach (var info in newInfos)
+        {
+            _writesByFunc[info] = uberWrites.Where(w => info.Nodes.Contains(w.Node)).ToList();
+            _readsByFunc[info] = uberReads.Where(r => info.Nodes.Contains(r.Node)).ToList();
+        }
+        _writesByFunc[uber] = uberWrites.Where(w => uber.Nodes.Contains(w.Node)).ToList();
+        _readsByFunc[uber] = uberReads.Where(r => uber.Nodes.Contains(r.Node)).ToList();
+        Functions.InsertRange(Functions.IndexOf(uber), newInfos); // events first, dispatcher after
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────────────────
+    // Pure calls. The editor draws calls to BlueprintPure functions without exec pins; the
+    // compiler still emits them as ordinary Let(temp = Call(...)) statements. When purity is
+    // PROVEN — the called UFunction's serialized FUNC_BlueprintPure flag, or its
+    // UFUNCTION(BlueprintPure) declaration mined from the engine source — and the statement's
+    // flow is strictly linear, the exec wire is routed straight through and the node keeps only
+    // its value pins. Anything unproven keeps its exec pins.
+    // ────────────────────────────────────────────────────────────────────────────────────────
+
+    private void DetachPureCalls(BlueprintFunctionInfo info)
+    {
+        foreach (var node in info.Nodes.Where(n => n.StatementIndex >= 0).OrderBy(n => n.StatementIndex).ToList())
+        {
+            var rhs = _stmtByNode.GetValueOrDefault(node) switch
+            {
+                EX_Let let => let.Assignment,
+                EX_LetBase letBase => letBase.Assignment,
+                _ => null,
+            };
+            if (rhs == null) continue;
+            var (pure, evidence) = IsPureCall(rhs);
+            if (!pure) continue;
+
+            BlueprintGraphConnection execIn = null, execOut = null;
+            int execInCount = 0, execOutCount = 0;
+            var hasDataOut = false;
+            foreach (var c in Connections)
+            {
+                if (c.Kind == EBlueprintEdgeKind.Data)
+                {
+                    if (c.SourceNode == node) hasDataOut = true;
+                    continue;
+                }
+                if (c.Kind == EBlueprintEdgeKind.Call) continue;
+                if (c.TargetNode == node) { execIn = c; execInCount++; }
+                if (c.SourceNode == node) { execOut = c; execOutCount++; }
+            }
+            // only a straight pass-through with a visible consumer detaches — jump targets,
+            // branch sources and dangling results keep their exec pins
+            if (execInCount != 1 || execOutCount != 1 || !hasDataOut || execOut.TargetNode == node) continue;
+
+            execIn.TargetNode = execOut.TargetNode;
+            execIn.TargetPinName = execOut.TargetPinName;
+            Connections.Remove(execOut);
+            node.InputPins.RemoveAll(p => !p.IsData);
+            node.OutputPins.RemoveAll(p => !p.IsData);
+            node.Kind = EBlueprintNodeKind.PureCall;
+            if (string.IsNullOrEmpty(node.Subtitle)) node.Subtitle = "pure";
+            node.DisplayProperties.Add(new("Pure", evidence));
+            ComputeHeight(node);
+        }
+    }
+
+    /// <summary>Whether the expression is a call to a provably BlueprintPure function, and the evidence for it.</summary>
+    private (bool Pure, string Evidence) IsPureCall(KismetExpression rhs)
+    {
+        var expr = rhs;
+        var guard = 0;
+        while (expr is EX_Context context && guard++ < 8) expr = context.ContextExpression;
+
+        switch (expr)
+        {
+            case EX_FinalFunction finalFn when finalFn.StackNode != null:
+            {
+                // the called function's own serialized flags, when it lives in the paks
+                try
+                {
+                    if (finalFn.StackNode.TryLoad(out var loaded) && loaded is UFunction called)
+                        return called.FunctionFlags.HasFlag(EFunctionFlags.FUNC_BlueprintPure)
+                            ? (true, "FUNC_BlueprintPure flag on the called function")
+                            : (false, null);
+                }
+                catch { /* native /Script imports aren't in the paks — engine-source table below */ }
+                var name = ShortName(finalFn.StackNode.Name);
+                var outer = finalFn.StackNode.ResolvedObject?.Outer?.Name.Text;
+                if (outer != null && BlueprintPureTable.PureFull.Contains($"{ShortName(outer)}:{name}"))
+                    return (true, $"UFUNCTION(BlueprintPure) on {ShortName(outer)}::{name} in the engine source");
+                if (BlueprintPureTable.PureNameOnly.Contains(name))
+                    return (true, $"UFUNCTION(BlueprintPure) on {name} in the engine source (name is never impure there)");
+                return (false, null);
+            }
+            case EX_VirtualFunction virtualFn:
+            {
+                var name = ShortName(virtualFn.VirtualFunctionName.Text);
+                if (_functionByName.TryGetValue(name, out var own))
+                    return own.FunctionFlags.HasFlag(EFunctionFlags.FUNC_BlueprintPure)
+                        ? (true, "FUNC_BlueprintPure flag on this class's function")
+                        : (false, null);
+                if (FindClassFunction(name) is { } inherited)
+                    return inherited.FunctionFlags.HasFlag(EFunctionFlags.FUNC_BlueprintPure)
+                        ? (true, "FUNC_BlueprintPure flag on the inherited function")
+                        : (false, null);
+                return BlueprintPureTable.PureNameOnly.Contains(name)
+                    ? (true, $"UFUNCTION(BlueprintPure) on {name} in the engine source (name is never impure there)")
+                    : (false, null);
+            }
+        }
+        return (false, null);
+    }
+
+    /// <summary>Resolves a function by name through the class's serialized FuncMap chain (parent Blueprints in the paks).</summary>
+    private UFunction FindClassFunction(string name)
+    {
+        var cls = _classExport;
+        for (var guard = 0; cls != null && guard < 16; guard++)
+        {
+            try
+            {
+                if (cls.FuncMap != null)
+                    foreach (var (fname, index) in cls.FuncMap)
+                        if (fname.Text == name && index.TryLoad(out var obj) && obj is UFunction found)
+                            return found;
+                cls = cls.SuperStruct != null && cls.SuperStruct.TryLoad(out var super) && super is UClass superClass
+                    ? superClass : null;
+            }
+            catch { return null; }
+        }
+        return null;
+    }
+
     /// <summary>The plain variable name behind an expression, when it is a direct variable token.</summary>
     private static string VarName(KismetExpression e) => (e as EX_VariableBase)?.Variable?.ToString();
 
-    /// <summary>One data input pin per call argument; parameter names resolved from the called UFunction when it is loadable (script/native imports fall back to positions).</summary>
+    /// <summary>
+    /// One data input pin per call argument. Parameter names come from real evidence only:
+    /// the called UFunction's serialized property list when it is loadable from the paks, else the
+    /// mined C++ declaration of the native function in the engine source — and the mined list is
+    /// used only when its length matches the argument count exactly. Anything unproven stays
+    /// positional ("Param N"), and the evidence source is recorded on the node.
+    /// </summary>
     private void AddCallInputs(BlueprintGraphNode node, FPackageIndex stackNode, KismetExpression[] parameters,
-        List<(BlueprintGraphNode Node, string Pin, string Var, string Token)> reads)
+        List<(BlueprintGraphNode Node, string Pin, string Var, string Token)> reads, string virtualName = null)
     {
         string[] names = null;
+        string evidence = null;
         try
         {
             if (stackNode != null && stackNode.TryLoad(out var loaded) && loaded is UFunction called)
+            {
                 names = CollectParams(called).Where(p => p.Dir != "Return").Select(p => p.Name).ToArray();
+                evidence = "serialized parameter properties of the called function";
+            }
         }
-        catch { /* imports from script packages aren't in the paks — positional names below */ }
+        catch { /* imports from script packages aren't in the paks — engine-source table below */ }
+
+        if (names == null && virtualName != null)
+        {
+            // virtual calls carry only a name; resolve through this class's own/inherited functions
+            var fn = _functionByName.TryGetValue(virtualName, out var own) ? own : FindClassFunction(virtualName);
+            if (fn != null)
+            {
+                names = CollectParams(fn).Where(p => p.Dir != "Return").Select(p => p.Name).ToArray();
+                evidence = "serialized parameter properties of the resolved function";
+            }
+        }
+
+        if (names == null)
+        {
+            var fnName = virtualName ?? (stackNode != null ? ShortName(stackNode.Name) : null);
+            var outer = stackNode?.ResolvedObject?.Outer?.Name.Text;
+            string joined = null;
+            if (fnName != null)
+            {
+                if (outer != null && BlueprintParamTable.ParamsFull.TryGetValue($"{ShortName(outer)}:{fnName}", out joined))
+                    evidence = $"C++ declaration of {ShortName(outer)}::{fnName} in the engine source";
+                else if (BlueprintParamTable.ParamsByName.TryGetValue(fnName, out joined))
+                    evidence = $"C++ declaration of {fnName} in the engine source (every declaration of that name agrees)";
+            }
+            if (joined != null)
+            {
+                var mined = joined.Split(',');
+                if (mined.Length == parameters.Length) names = mined;
+                else { evidence = null; } // count mismatch (engine version drift) — don't mislabel
+            }
+            else evidence = null;
+        }
+
+        if (names != null && evidence != null && parameters.Length > 0)
+            node.DisplayProperties.Add(new("Param Names", evidence));
 
         for (var i = 0; i < parameters.Length; i++)
         {
@@ -1535,9 +1881,9 @@ public class BlueprintGraphViewModel
                         if (index != null && index.TryLoad(out var timeline) && timeline != null)
                             Components.Add(new BlueprintComponentInfo
                             {
+                                Kind = EBlueprintComponentKind.Timeline,
                                 Name = timeline.Name.EndsWith("_Template") ? timeline.Name[..^9] : timeline.Name,
                                 Class = "Timeline",
-                                AttachInfo = "timeline template",
                                 InheritedFrom = inheritedFrom,
                             });
                 }
@@ -1597,6 +1943,7 @@ public class BlueprintGraphViewModel
         if (name.EndsWith("_GEN_VARIABLE")) name = name[..^13];
         var info = new BlueprintComponentInfo
         {
+            Kind = EBlueprintComponentKind.Runtime,
             Name = name,
             Class = template.Class != null && ShortName(template.Class.Name.Text) is { Length: > 0 } c ? c : "Component",
             AttachInfo = note,

@@ -730,6 +730,7 @@ public partial class BlueprintGraphViewer
         EBlueprintNodeKind.Flow => "Execution-flow control. Push/Pop manage the VM's flow stack for latent actions and sequence continuations.",
         EBlueprintNodeKind.Return => "Return. Ends this function's execution.",
         EBlueprintNodeKind.Call => "Function call. A Call pin (if present) dispatches into another function's bytecode, e.g. the event graph's ubergraph.",
+        EBlueprintNodeKind.PureCall => "Pure function call. The called function is provably BlueprintPure (see the Pure row for the evidence), so — like in the editor — it has no exec pins; execution passes straight through and only the value wires matter.",
         EBlueprintNodeKind.Assign => "Assignment. Writes the evaluated right-hand expression into the target variable/property.",
         EBlueprintNodeKind.VariableGet => "Variable read. The consuming statement's bytecode argument is this variable token; it is shown as an editor-style Get node feeding the pin.",
         _ => null
@@ -780,8 +781,40 @@ public partial class BlueprintGraphViewer
                 Margin = new Thickness(0, 0, 0, 4),
                 TextWrapping = TextWrapping.Wrap
             });
-            foreach (var component in _viewModel.Components)
-                AddComponentRow(component);
+
+            var scene = _viewModel.Components.Where(c => c.Kind == EBlueprintComponentKind.SceneTree).ToList();
+            var runtime = _viewModel.Components.Where(c => c.Kind == EBlueprintComponentKind.Runtime).ToList();
+            var timelines = _viewModel.Components.Where(c => c.Kind == EBlueprintComponentKind.Timeline).ToList();
+
+            if (scene.Count > 0)
+            {
+                var tree = new StackPanel();
+                for (var i = 0; i < scene.Count; i++)
+                    AddComponentRow(tree, scene, i);
+                PropertiesPanel.Children.Add(new Border
+                {
+                    Background = new SolidColorBrush(Color.FromRgb(24, 24, 28)),
+                    CornerRadius = new CornerRadius(4),
+                    Padding = new Thickness(4, 3, 4, 3),
+                    Child = tree
+                });
+            }
+            if (runtime.Count > 0)
+            {
+                AddComponentSectionLabel("Added at runtime (AddComponent nodes)");
+                var panel = new StackPanel();
+                for (var i = 0; i < runtime.Count; i++)
+                    AddComponentRow(panel, runtime, i);
+                PropertiesPanel.Children.Add(panel);
+            }
+            if (timelines.Count > 0)
+            {
+                AddComponentSectionLabel("Timelines");
+                var panel = new StackPanel();
+                for (var i = 0; i < timelines.Count; i++)
+                    AddComponentRow(panel, timelines, i);
+                PropertiesPanel.Children.Add(panel);
+            }
         }
 
         if (_viewModel.Functions.Count == 0) return;
@@ -818,39 +851,163 @@ public partial class BlueprintGraphViewer
         }
     }
 
-    /// <summary>One row of the Components tree: indented by depth, "Name (Class)" + asset/attachment line, template properties in the tooltip.</summary>
-    private void AddComponentRow(BlueprintComponentInfo component)
-    {
-        var row = new StackPanel { Margin = new Thickness(component.Depth * 14, 1, 0, 1) };
+    private void AddComponentSectionLabel(string text) =>
+        PropertiesPanel.Children.Add(new TextBlock
+        {
+            Text = text,
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            Opacity = 0.65,
+            Margin = new Thickness(0, 8, 0, 2)
+        });
 
+    /// <summary>
+    /// One row of the Components tree, drawn like the editor's Components panel: tree guide
+    /// lines per ancestor level, a per-category icon, "Name  Class", then the asset/attachment
+    /// detail line. Template properties stay in the tooltip.
+    /// </summary>
+    private void AddComponentRow(Panel parent, List<BlueprintComponentInfo> list, int index)
+    {
+        var component = list[index];
+        var guideBrush = new SolidColorBrush(Color.FromArgb(70, 255, 255, 255));
+
+        var cells = new StackPanel { Orientation = Orientation.Horizontal };
+        // guide line per ancestor level: drawn while that ancestor still has siblings below
+        for (var level = 1; level < component.Depth; level++)
+        {
+            var continues = false;
+            for (var j = index + 1; j < list.Count; j++)
+            {
+                if (list[j].Depth > level) continue;
+                continues = list[j].Depth == level;
+                break;
+            }
+            cells.Children.Add(TreeGuideCell(continues ? guideBrush : null));
+        }
+        if (component.Depth > 0)
+        {
+            var hasLaterSibling = false;
+            for (var j = index + 1; j < list.Count; j++)
+            {
+                if (list[j].Depth > component.Depth) continue;
+                hasLaterSibling = list[j].Depth == component.Depth;
+                break;
+            }
+            cells.Children.Add(TreeElbowCell(guideBrush, hasLaterSibling));
+        }
+        cells.Children.Add(ComponentIcon(component.Class));
+
+        var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
         var headerLine = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis };
-        headerLine.Inlines.Add(new System.Windows.Documents.Run(component.Depth > 0 ? "└ " : "")
-            { Foreground = new SolidColorBrush(Color.FromArgb(120, 255, 255, 255)) });
         headerLine.Inlines.Add(new System.Windows.Documents.Run(component.Name)
             { FontWeight = FontWeights.SemiBold, FontSize = 11 });
-        headerLine.Inlines.Add(new System.Windows.Documents.Run($"  ({component.Class})")
-            { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(120, 190, 140)) });
+        headerLine.Inlines.Add(new System.Windows.Documents.Run($"  {component.Class}")
+            { FontSize = 10, Foreground = new SolidColorBrush(Color.FromArgb(190, 120, 190, 140)) });
         if (component.InheritedFrom != null)
             headerLine.Inlines.Add(new System.Windows.Documents.Run($"  inherited: {component.InheritedFrom}")
                 { FontSize = 9, Foreground = new SolidColorBrush(Color.FromArgb(150, 200, 180, 90)) });
-        row.Children.Add(headerLine);
+        text.Children.Add(headerLine);
 
-        var detail = string.Join("   ",
-            new[] { component.Asset, component.AttachInfo }.Where(s => !string.IsNullOrEmpty(s)));
+        var detail = string.Join("   ", new[]
+        {
+            component.Asset,
+            component.Kind == EBlueprintComponentKind.SceneTree ? component.AttachInfo : null
+        }.Where(s => !string.IsNullOrEmpty(s)));
         if (detail.Length > 0)
-            row.Children.Add(new TextBlock
+            text.Children.Add(new TextBlock
             {
                 Text = detail,
                 FontSize = 10,
                 Opacity = 0.7,
-                Margin = new Thickness(12, 0, 0, 0),
                 TextTrimming = TextTrimming.CharacterEllipsis
             });
+        cells.Children.Add(text);
 
+        var row = new Border
+        {
+            Background = Brushes.Transparent,
+            CornerRadius = new CornerRadius(3),
+            Padding = new Thickness(3, 1, 3, 1),
+            Child = cells
+        };
         if (component.TemplateProperties.Count > 0)
             row.ToolTip = string.Join("\n", component.TemplateProperties.Select(p => $"{p.Key} = {p.Value}"));
+        row.MouseEnter += (_, _) => row.Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255));
+        row.MouseLeave += (_, _) => row.Background = Brushes.Transparent;
+        parent.Children.Add(row);
+    }
 
-        PropertiesPanel.Children.Add(row);
+    /// <summary>A 14px indent cell carrying (or not) a full-height vertical guide line.</summary>
+    private static UIElement TreeGuideCell(Brush brush)
+    {
+        var grid = new Grid { Width = 14 };
+        if (brush != null)
+            grid.Children.Add(new Rectangle { Width = 1, Fill = brush, HorizontalAlignment = HorizontalAlignment.Center });
+        return grid;
+    }
+
+    /// <summary>The connector cell: ├ when more siblings follow below, └ for the last child.</summary>
+    private static UIElement TreeElbowCell(Brush brush, bool continuesDown)
+    {
+        var grid = new Grid { Width = 14 };
+        grid.RowDefinitions.Add(new RowDefinition());
+        grid.RowDefinitions.Add(new RowDefinition());
+        var vertical = new Rectangle { Width = 1, Fill = brush, HorizontalAlignment = HorizontalAlignment.Center };
+        if (continuesDown) Grid.SetRowSpan(vertical, 2);
+        grid.Children.Add(vertical);
+        var horizontal = new Rectangle
+        {
+            Height = 1, Fill = brush,
+            Margin = new Thickness(7, 0, 2, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetRowSpan(horizontal, 2);
+        grid.Children.Add(horizontal);
+        return grid;
+    }
+
+    /// <summary>Small vector glyph per component category (purely cosmetic — the class name is always printed beside it).</summary>
+    private static UIElement ComponentIcon(string className)
+    {
+        var (data, color) = ComponentIconData(className ?? string.Empty);
+        return new Path
+        {
+            Data = Geometry.Parse(data),
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 1.1,
+            StrokeLineJoin = PenLineJoin.Round,
+            Width = 13,
+            Height = 13,
+            Stretch = Stretch.Uniform,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(1, 0, 6, 0)
+        };
+    }
+
+    private static (string Data, Color Color) ComponentIconData(string cls)
+    {
+        bool Has(string s) => cls.Contains(s, StringComparison.OrdinalIgnoreCase);
+        if (Has("SkeletalMesh")) return ("M7,1 A2,2 0 1 1 6.99,1 M7,5 L7,9 M7,6 L3.5,8 M7,6 L10.5,8 M7,9 L4.5,13 M7,9 L9.5,13", Color.FromRgb(232, 150, 170));
+        if (Has("StaticMesh") || Has("Mesh")) return ("M7,1 L13,4 L13,10 L7,13 L1,10 L1,4 Z M1,4 L7,7 L13,4 M7,7 L7,13", Color.FromRgb(150, 185, 235));
+        if (Has("Audio") || Has("Sound")) return ("M1.5,5 L4,5 L7,2 L7,12 L4,9 L1.5,9 Z M9.5,4.5 A3.5,3.5 0 0 1 9.5,9.5 M11.5,3 A5.5,5.5 0 0 1 11.5,11", Color.FromRgb(90, 200, 200));
+        if (Has("Light")) return ("M7,1.5 A3.5,3.5 0 1 1 6.99,1.5 M5.5,10.5 L8.5,10.5 M6,12.5 L8,12.5", Color.FromRgb(240, 215, 110));
+        if (Has("Camera")) return ("M1,4 L9,4 L9,10 L1,10 Z M9,6.5 L13,4 L13,10 L9,7.5", Color.FromRgb(180, 150, 230));
+        if (Has("Niagara") || Has("Particle") || Has("Emitter")) return ("M7,1 L7,13 M1,7 L13,7 M3.5,3.5 L10.5,10.5 M10.5,3.5 L3.5,10.5", Color.FromRgb(240, 165, 90));
+        if (Has("SpringArm")) return ("M2,12.5 L8,6.5 L12,6.5 M12,6.5 A1.3,1.3 0 1 1 11.99,6.5", Color.FromRgb(170, 180, 195));
+        if (Has("Capsule")) return ("M4,4.5 A3,3 0 0 1 10,4.5 L10,9.5 A3,3 0 0 1 4,9.5 Z", Color.FromRgb(130, 205, 130));
+        if (Has("Sphere")) return ("M7,1.5 A5.5,5.5 0 1 1 6.99,1.5 M1.5,7 L12.5,7", Color.FromRgb(130, 205, 130));
+        if (Has("Box") || Has("Collision") || Has("Trigger")) return ("M2,2 L12,2 L12,12 L2,12 Z", Color.FromRgb(130, 205, 130));
+        if (Has("Widget")) return ("M1,2.5 L13,2.5 L13,11.5 L1,11.5 Z M1,5.5 L13,5.5", Color.FromRgb(100, 200, 220));
+        if (Has("Text")) return ("M2.5,2.5 L11.5,2.5 M7,2.5 L7,12", Color.FromRgb(200, 200, 210));
+        if (Has("Spline")) return ("M1,12 C4,1 10,13 13,2", Color.FromRgb(230, 200, 120));
+        if (Has("Decal")) return ("M2,2 L12,2 L12,12 L2,12 Z M4.5,4.5 L9.5,4.5 L9.5,9.5 L4.5,9.5 Z", Color.FromRgb(190, 160, 210));
+        if (Has("Movement") || Has("Projectile")) return ("M1,7 L11,7 M8,3.5 L11.5,7 L8,10.5", Color.FromRgb(220, 170, 120));
+        if (Has("Arrow")) return ("M1,7 L11,7 M8,3.5 L11.5,7 L8,10.5", Color.FromRgb(200, 120, 110));
+        if (Has("Billboard") || Has("Sprite")) return ("M1,3 L13,3 L13,11 L1,11 Z M3,9 L6,5.5 L8,7.5 L10,5 L13,9", Color.FromRgb(170, 190, 200));
+        if (Has("Timeline")) return ("M7,1.5 A5.5,5.5 0 1 1 6.99,1.5 M7,3.5 L7,7 L10,8.5", Color.FromRgb(150, 200, 160));
+        if (Has("Child") || Has("Actor")) return ("M4,2 L12,2 L12,10 L4,10 Z M2,4.5 L4,4.5 M2,4.5 L2,12 L9.5,12 L9.5,10", Color.FromRgb(180, 180, 200));
+        if (Has("Scene")) return ("M2,12 L7,7 M7,7 L7,1 M7,7 L13,10", Color.FromRgb(175, 185, 195));
+        return ("M7,2.5 A4.5,4.5 0 1 1 6.99,2.5", Color.FromRgb(165, 170, 180));
     }
 
     private void AddPropertyRow(string key, string value, string toolTip = null)
@@ -1104,6 +1261,7 @@ public partial class BlueprintGraphViewer
         EBlueprintNodeKind.Flow => Color.FromRgb(110, 70, 160),
         EBlueprintNodeKind.Return => Color.FromRgb(160, 50, 50),
         EBlueprintNodeKind.Call => Color.FromRgb(50, 90, 170),
+        EBlueprintNodeKind.PureCall => Color.FromRgb(45, 130, 70),
         EBlueprintNodeKind.Assign => Color.FromRgb(40, 110, 80),
         EBlueprintNodeKind.VariableGet => Color.FromRgb(70, 130, 85),
         _ => Color.FromRgb(72, 72, 82),
