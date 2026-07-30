@@ -61,6 +61,23 @@ public class PixelShaderWiring
     public string ShaderTypeName { get; set; } = string.Empty;
     public string FailureReason { get; set; } = string.Empty;
     public bool Success { get; set; }
+    /// <summary>
+    /// How the optional GBuffer targets past MRT3 were named for this shader (which one holds the
+    /// custom data, whether a tangent/anisotropy target exists), so the reading behind the
+    /// Custom Data / Subsurface Color / Tangent / Anisotropy pins is visible rather than implicit.
+    /// </summary>
+    public string GBufferLayout { get; set; } = string.Empty;
+    /// <summary>
+    /// How the World Position Offset pin was resolved, or why it could not be: WPO lives in the
+    /// vertex shader, so it is recovered from a separate stage than the rest of the pins.
+    /// </summary>
+    public string WorldPositionOffsetNote { get; set; }
+    /// <summary>Render target that held the GBuffer custom data for this shader, or -1.</summary>
+    public int CustomDataTarget { get; set; } = -1;
+    /// <summary>Render target that held GBufferF (tangent + anisotropy) for this shader, or -1.</summary>
+    public int TangentTarget { get; set; } = -1;
+    /// <summary>Shading model the GBuffer encoding was compiled for, for the pin roots.</summary>
+    public EMaterialShadingModel ShadingModel { get; set; } = EMaterialShadingModel.MSM_DefaultLit;
 }
 
 /// <summary>
@@ -155,7 +172,8 @@ public static class MaterialPixelShaderAnalyzer
     /// the caller has no library to read, which keeps the previous inline-only behaviour.
     /// </param>
     public static PixelShaderWiring Analyze(FMaterialShaderMap shaderMap, FUniformExpressionSet expressionSet, bool usesGBuffer,
-        Func<int, (byte[] Blob, string Error)> sharedCode = null)
+        Func<int, (byte[] Blob, string Error)> sharedCode = null,
+        EMaterialShadingModel shadingModel = EMaterialShadingModel.MSM_DefaultLit)
     {
         var wiring = new PixelShaderWiring();
         var code = shaderMap?.Code;
@@ -182,10 +200,19 @@ public static class MaterialPixelShaderAnalyzer
         {
             try
             {
-                if (TryAnalyzeShader(shader, typeName, code, sharedCode, expressionSet, usesGBuffer, wiring, out var error))
+                if (TryAnalyzeShader(shader, typeName, code, sharedCode, expressionSet, usesGBuffer, shadingModel, wiring, out var error))
                 {
                     wiring.Success = true;
                     wiring.ShaderTypeName = typeName;
+                    try
+                    {
+                        // WPO lives in the vertex shader, so it needs its own stage pass
+                        WireWorldPositionOffset(content, code, sharedCode, expressionSet, wiring);
+                    }
+                    catch
+                    {
+                        // auxiliary: never fail the recovered pixel wiring over the vertex pass
+                    }
                     return wiring;
                 }
                 lastError = error;
@@ -198,6 +225,67 @@ public static class MaterialPixelShaderAnalyzer
 
         wiring.FailureReason = lastError;
         return wiring;
+    }
+
+    /// <summary>
+    /// Adds the World Position Offset sources from the map's base-pass vertex shader — the stage
+    /// that evaluates WPO — to a successful pixel-shader result. Vertex shaders are tried
+    /// richest-first; a material without WPO simply leaves the pin unwired.
+    /// </summary>
+    private static void WireWorldPositionOffset(FMaterialShaderMapContent content, FShaderMapResourceCode code,
+        Func<int, (byte[] Blob, string Error)> sharedCode, FUniformExpressionSet expressionSet, PixelShaderWiring wiring)
+    {
+        var vertexShaders = new List<FShader>();
+        void Collect(FShader[] shaders)
+        {
+            foreach (var shader in shaders ?? [])
+                if (shader?.Target.Frequency == EShaderFrequency.SF_Vertex)
+                    vertexShaders.Add(shader);
+        }
+        Collect(content.Shaders);
+        foreach (var mesh in content.OrderedMeshShaderMaps ?? [])
+            Collect(mesh.Shaders);
+
+        foreach (var shader in vertexShaders.OrderByDescending(s => s.NumInstructions).Take(6))
+        {
+            if (!TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
+            {
+                wiring.WorldPositionOffsetNote ??= slotReason;
+                continue;
+            }
+
+            byte[] blob;
+            try
+            {
+                if (code is { ShaderEntries.Length: > 0 })
+                {
+                    if (shader.ResourceIndex < 0 || shader.ResourceIndex >= code.ShaderEntries.Length) continue;
+                    var entry = code.ShaderEntries[shader.ResourceIndex];
+                    if (entry.Code is not { Length: > 0 }) continue;
+                    blob = entry.Code.Length == entry.UncompressedSize
+                        ? entry.Code
+                        : Compression.Decompress(entry.Code, entry.UncompressedSize, CompressionMethod.LZ4);
+                }
+                else
+                {
+                    if (sharedCode == null) return;
+                    blob = sharedCode(shader.ResourceIndex).Blob;
+                    if (blob is not { Length: > 0 }) continue;
+                }
+            }
+            catch { continue; }
+
+            var sources = AnalyzeWorldPositionOffset(blob, expressionSet, materialSlot, out var error, out var expression);
+            if (sources == null)
+            {
+                wiring.WorldPositionOffsetNote ??= error;
+                continue;
+            }
+            wiring.PinSources["World Position Offset"] = sources;
+            if (expression != null) wiring.PinExpressions["World Position Offset"] = expression;
+            wiring.WorldPositionOffsetNote = "recovered from the base-pass vertex shader's position output";
+            return;
+        }
     }
 
     #endregion
@@ -213,7 +301,382 @@ public static class MaterialPixelShaderAnalyzer
     /// — it is the constant buffer whose row loads land on serialized preshader fields — so nothing
     /// is guessed. Returns the same <see cref="PixelShaderWiring"/> the SM5 path produces.
     /// </summary>
-    public static PixelShaderWiring AnalyzeDxil(byte[] blob, FUniformExpressionSet expressionSet, EGame game, bool usesGBuffer)
+    /// <summary>
+    /// The material values the base-pass VERTEX shader routes into its position output — which is
+    /// the material's World Position Offset. BasePassVertexShader.usf computes the vertex's world
+    /// position as WorldPosition + GetMaterialWorldPositionOffset(VertexParameters) and transforms
+    /// that into SV_Position; the material's other vertex-stage output (customized UVs) goes to
+    /// TEXCOORD elements instead. So a Material-uniform or Material-texture value that reaches the
+    /// position element can only have arrived through the WPO input. Returns the sources, or null
+    /// with the reason it could not be read.
+    /// </summary>
+    public static List<PixelValueSource> AnalyzeDxilWorldPositionOffset(byte[] blob, FUniformExpressionSet expressionSet,
+        int materialRegister, out string error, out PixelExpressionNode expression)
+    {
+        error = null;
+        expression = null;
+        try
+        {
+            if (!TryGetSignatureElements(blob, out var elements, out error)) return null;
+            // D3D_NAME_POSITION == 1 in the container's system-value field
+            var positionSig = elements.FindIndex(e => e.SystemValue == 1 ||
+                                                      e.Name.Equals("SV_Position", StringComparison.OrdinalIgnoreCase));
+            if (positionSig < 0) { error = "the vertex shader declares no position output"; return null; }
+
+            var module = DxilModule.Parse(blob);
+            var fn = module.Functions.FirstOrDefault();
+            if (fn == null) { error = "the DXIL module has no function body"; return null; }
+            var resources = DxilTaint.BuildResources(module);
+            var handles = DxilTaint.ResolveHandles(module, fn);
+
+            var leaves = new List<DxLeaf>();
+            var allLeaves = new List<DxLeaf>();
+            var positionStores = new List<(int Col, int ValId)>();
+            foreach (var store in fn.Instructions.Where(i => i.Callee != null && i.Callee.StartsWith("dx.op.storeOutput")))
+            {
+                var sig = (int) (DxilTaint.ConstOp(fn, store, 1) ?? -1);
+                var col = (int) (DxilTaint.ConstOp(fn, store, 3) ?? -1);
+                var valId = store.Operands.Count > 4 ? store.Operands[4] : -1;
+                var tainted = DxilTaint.Taint(fn, resources, handles, valId, col);
+                allLeaves.AddRange(tainted);
+                if (sig != positionSig) continue;
+                leaves.AddRange(tainted);
+                if (valId >= 0) positionStores.Add((col, valId));
+            }
+            if (leaves.Count == 0) { error = "the vertex shader's position output reads no material value"; return null; }
+
+            // the Material buffer must be identified by NAME here: a vertex shader reads mostly
+            // View/Primitive constants, so the pixel path's "buffer with the most preshader-shaped
+            // loads" fallback would happily label the View buffer as the material's
+            // the Material buffer is taken from the shader's serialized parameter map, never from
+            // the pixel path's "buffer with the most preshader-shaped loads" fallback: a vertex
+            // shader reads mostly View/Primitive constants and that fallback would mislabel them
+            var resolve = BuildDxilResolve(blob, expressionSet, allLeaves, materialRegister);
+            var sources = new List<PixelValueSource>();
+            foreach (var leaf in leaves)
+                if (resolve(leaf) is { } source && !sources.Contains(source))
+                    sources.Add(source);
+            if (sources.Count == 0) { error = "the vertex shader's position output reads no material value"; return null; }
+
+            // the same DAG recovery the pixel pins get, so Expand Shader Math can open this pin too
+            try
+            {
+                var parts = positionStores
+                    .OrderBy(store => store.Col)
+                    .Select(store => DxilTaint.BuildExpression(fn, resources, handles, store.ValId, store.Col, resolve))
+                    .Where(node => node != null)
+                    .ToList();
+                if (parts.Count == 1) expression = parts[0];
+                else if (parts.Count > 1)
+                {
+                    var append = new PixelExpressionNode { Op = "append" };
+                    for (var i = 0; i < parts.Count; i++)
+                        append.Args.Add(new PixelExpressionArg { Node = parts[i], Name = i < 4 ? "xyzw"[i].ToString() : $"c{i}" });
+                    expression = append;
+                }
+                if (expression != null) expression = PruneToMaterialSubtree(expression);
+            }
+            catch
+            {
+                // expansion is auxiliary — the pin still wires without its DAG
+            }
+            return sources;
+        }
+        catch (Exception e)
+        {
+            error = $"vertex shader analysis failed: {e.Message}";
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// SM5 counterpart of <see cref="AnalyzeDxilWorldPositionOffset"/>: the material values the
+    /// base-pass vertex shader routes into SV_Position, i.e. its World Position Offset. Same
+    /// reasoning as the DXIL path — WPO is the only material input to the vertex position — and the
+    /// same serialized source for the Material constant-buffer slot.
+    /// </summary>
+    public static List<PixelValueSource> AnalyzeWorldPositionOffset(byte[] blob, FUniformExpressionSet expressionSet,
+        int materialSlot, out string error, out PixelExpressionNode expression)
+    {
+        error = null;
+        expression = null;
+        try
+        {
+            var pos = 0;
+            ReadU32(blob, ref pos); // ResourceTableBits
+            var srvMap = ReadResourceMap(blob, ref pos);
+            ReadResourceMap(blob, ref pos); // SamplerMap
+            ReadResourceMap(blob, ref pos); // UnorderedAccessViewMap
+            ReadResourceMap(blob, ref pos); // ResourceTableLayoutHashes
+            var textureMap = ReadResourceMap(blob, ref pos);
+            if (!HasDxbcMagic(blob, pos)) { error = "the vertex shader is not D3D SM5 DXBC"; return null; }
+
+            if (!TryParseDxbcContainer(blob, pos, out _, out var program, out var inputSemantics, out var outputSemantics, out var containerError, requireOutputSignature: false))
+            {
+                error = containerError;
+                return null;
+            }
+            if (program == null || program.Length < 2) { error = "the vertex shader has no program chunk"; return null; }
+
+            var positionRegister = outputSemantics
+                .Where(kv => kv.Value.StartsWith("SV_Position", StringComparison.OrdinalIgnoreCase))
+                .Select(kv => (long?) kv.Key)
+                .FirstOrDefault();
+            if (positionRegister is not { } positionReg) { error = "the vertex shader declares no position output"; return null; }
+
+            var instructions = DecodeProgram(program, out _, out var resourceDimensions);
+
+            var vtStackCount = expressionSet.VTStacks?.Length ?? 0;
+            var virtualCount = CountTextureSlot(expressionSet, 4);
+            var vecCount = expressionSet.UniformVectorPreshaders?.Length ?? 0;
+            var scalarCount = expressionSet.UniformScalarPreshaders?.Length ?? 0;
+            var vecBase = vtStackCount * 32 + virtualCount * 16;
+
+            var context = new AnalysisContext
+            {
+                MaterialSlot = materialSlot,
+                VecBase = vecBase,
+                ScalarBase = vecBase + vecCount * 16,
+                VecCount = vecCount,
+                ScalarCount = scalarCount,
+                TextureByRegister = BuildTextureRegisterMap(expressionSet, materialSlot, srvMap, textureMap)
+            };
+            var (state, _) = RunTaintAnalysis(instructions, context);
+
+            if (!state.Registers.TryGetValue(('o', positionReg), out var components))
+            {
+                error = "the vertex shader's position output reads no material value";
+                return null;
+            }
+            var sources = new List<PixelValueSource>();
+            foreach (var component in components)
+                foreach (var source in component)
+                    if (!sources.Contains(source)) sources.Add(source);
+            if (sources.Count == 0) { error = "the vertex shader's position output reads no material value"; return null; }
+
+            // recover the position output's expression DAG so Expand Shader Math opens this pin too
+            try
+            {
+                var stageResults = new Dictionary<string, PixelExpressionNode>();
+                BuildPinExpressions(instructions, context, new Dictionary<long, int>(), usesGBuffer: false,
+                    new Dictionary<int, string>(), inputSemantics, resourceDimensions, new PixelShaderWiring(),
+                    resultOverride: stageResults, outputSemantics: outputSemantics);
+                foreach (var (label, node) in stageResults)
+                    if (label.StartsWith("SV_Position", StringComparison.OrdinalIgnoreCase))
+                    {
+                        expression = PruneToMaterialSubtree(node);
+                        break;
+                    }
+            }
+            catch
+            {
+                // expansion is auxiliary — the pin still wires without its DAG
+            }
+            return sources;
+        }
+        catch (Exception e)
+        {
+            error = $"vertex shader analysis failed: {e.Message}";
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The register the material's data-driven uniform buffer is bound to in this shader, from the
+    /// shader's own serialized parameter map: uniform buffers with a static slot are auto-bound and
+    /// listed in UniformBufferParameters, so the buffer that appears in the parameter map but NOT
+    /// there is the Material buffer (ShaderParameterMetadata GetStructList only registers
+    /// static-slot structs). Returns false when the shader binds none or more than one, which is
+    /// the only honest answer without the shader's reflection names.
+    /// </summary>
+    public static bool TryGetMaterialUniformBufferSlot(FShader shader, out int slot, out string reason)
+    {
+        slot = -1;
+        var autoBound = new HashSet<int>((shader?.UniformBufferParameters ?? []).Select(p => (int) p.BaseIndex));
+        var unnamed = (shader?.ParameterMapInfo?.UniformBuffers ?? [])
+            .Select(p => (int) p.BaseIndex)
+            .Distinct()
+            .Where(s => !autoBound.Contains(s))
+            .ToList();
+        switch (unnamed.Count)
+        {
+            case 1:
+                slot = unnamed[0];
+                reason = null;
+                return true;
+            case 0:
+                // every buffer this stage binds is an auto-bound engine one (View, the vertex
+                // factory, …): the material contributes no constant to it
+                reason = "the vertex shader binds no material constants, so nothing material-driven reaches the vertex position";
+                return false;
+            default:
+                reason = "the vertex shader binds several non-engine uniform buffers, so the Material one cannot be told apart";
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Trims a vertex-position expression down to the material's part of it. The position output's
+    /// full DAG is the whole transform chain — vertex fetches, the local-to-world and
+    /// world-to-clip matrices, the View buffer — and only the branches that carry a material value
+    /// are the World Position Offset the artist authored. Branches with no material leaf collapse
+    /// into one labelled "engine value" leaf, so what is shown is the real combining math with the
+    /// engine's own inputs named honestly rather than expanded. Returns null when no branch
+    /// carries a material value.
+    /// </summary>
+    private static PixelExpressionNode PruneToMaterialSubtree(PixelExpressionNode root)
+    {
+        var carries = new Dictionary<PixelExpressionNode, bool>();
+        bool Carries(PixelExpressionNode node)
+        {
+            if (carries.TryGetValue(node, out var known)) return known;
+            carries[node] = false; // cycle guard: a node cannot justify itself
+            var result = node.Source is { Kind: PixelValueKind.VectorExpression or PixelValueKind.ScalarExpression
+                or PixelValueKind.UniformExpression or PixelValueKind.Texture };
+            foreach (var arg in node.Args)
+                result |= Carries(arg.Node);
+            carries[node] = result;
+            return result;
+        }
+        if (!Carries(root)) return null;
+
+        var rewritten = new Dictionary<PixelExpressionNode, PixelExpressionNode>();
+        var engineLeaves = new Dictionary<string, PixelExpressionNode>();
+        PixelExpressionNode EngineLeaf(PixelExpressionNode original)
+        {
+            // leaves already read as themselves (a View constant, a vertex input, a literal), so
+            // only whole engine SUBTREES collapse — that is what removes the transform chain
+            if (original.Args.Count == 0) return original;
+            var detail = original.Detail.Length > 0
+                ? $"engine value ({original.Op} {original.Detail})"
+                : $"engine value ({original.Op})";
+            if (!engineLeaves.TryGetValue(detail, out var leaf))
+                engineLeaves[detail] = leaf = new PixelExpressionNode { Op = "opaque", Detail = detail };
+            return leaf;
+        }
+        PixelExpressionNode Rewrite(PixelExpressionNode node)
+        {
+            if (rewritten.TryGetValue(node, out var done)) return done;
+            if (!Carries(node)) return rewritten[node] = EngineLeaf(node);
+
+            var copy = new PixelExpressionNode
+            {
+                Op = node.Op, Saturate = node.Saturate, Constants = node.Constants,
+                Source = node.Source, Detail = node.Detail, ChannelMap = node.ChannelMap
+            };
+            rewritten[node] = copy;
+            foreach (var arg in node.Args)
+                copy.Args.Add(new PixelExpressionArg
+                {
+                    Node = Rewrite(arg.Node), Name = arg.Name, Swizzle = arg.Swizzle,
+                    Negate = arg.Negate, Absolute = arg.Absolute
+                });
+            return copy;
+        }
+        return Rewrite(root);
+    }
+
+    /// <summary>
+    /// Resolves decoded DXIL leaves to serialized material values: the Material constant buffer is
+    /// the cb whose row loads land on serialized preshader fields (structural, never guessed), and
+    /// texture registers map through the UE D3D shader-resource-table prefix.
+    /// </summary>
+    private static Func<DxLeaf, PixelValueSource?> BuildDxilResolve(byte[] blob, FUniformExpressionSet expressionSet,
+        IEnumerable<DxLeaf> leaves, int namedMaterialRegister = -1)
+    {
+        var offsetMap = BuildPreshaderOffsetMap(expressionSet);
+
+        // the DXIL resource metadata names the buffer when it is present; otherwise fall back to
+        // the buffer whose row loads land on serialized preshader fields
+        var materialReg = namedMaterialRegister;
+        if (materialReg < 0)
+        {
+            var cbHit = new Dictionary<int, int>();
+            foreach (var leaf in leaves.Where(l => l.Kind == "cbuffer"))
+            {
+                var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
+                if (offsetMap.ContainsKey(off)) cbHit[leaf.Register] = cbHit.GetValueOrDefault(leaf.Register) + 1;
+            }
+            materialReg = cbHit.Count > 0 ? cbHit.OrderByDescending(k => k.Value).First().Key : -1;
+        }
+
+        var pos = 0;
+        ReadU32(blob, ref pos);
+        var srvMap = ReadResourceMap(blob, ref pos);
+        ReadResourceMap(blob, ref pos); // sampler
+        ReadResourceMap(blob, ref pos); // uav
+        ReadResourceMap(blob, ref pos); // layout hashes
+        var textureMap = ReadResourceMap(blob, ref pos);
+        var textureByRegister = materialReg >= 0
+            ? BuildTextureRegisterMap(expressionSet, materialReg, srvMap, textureMap)
+            : new Dictionary<long, (int Slot, int Index)>();
+
+        return leaf =>
+        {
+            if (leaf.Kind == "cbuffer" && leaf.Register == materialReg)
+            {
+                var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
+                if (offsetMap.TryGetValue(off, out var uni)) return PixelValueSource.Uniform(uni);
+            }
+            else if (leaf.Kind == "texture" && textureByRegister.TryGetValue(leaf.Register, out var tex))
+            {
+                return PixelValueSource.Texture(tex.Slot, tex.Index, leaf.Component is >= 0 and <= 3 ? leaf.Component : -1);
+            }
+            return null;
+        };
+    }
+
+    /// <summary>
+    /// Output signature elements of a compiled shader, read from the OSGN/OSG1/OSG5 chunk of the
+    /// DXBC container the UE blob wraps (the same container carries the DXIL chunk on SM6). The
+    /// element order is the signature element id DXIL's storeOutput indexes.
+    /// </summary>
+    private static bool TryGetSignatureElements(byte[] blob,
+        out List<(string Name, int SemanticIndex, int SystemValue, int Register, int Mask)> elements, out string error)
+    {
+        elements = [];
+        error = null;
+        string FourCC(int o) => o + 4 <= blob.Length ? new string([(char) blob[o], (char) blob[o + 1], (char) blob[o + 2], (char) blob[o + 3]]) : string.Empty;
+
+        var containerStart = -1;
+        for (var i = 0; i + 4 <= blob.Length; i++)
+            if (FourCC(i) == "DXBC") { containerStart = i; break; }
+        if (containerStart < 0) { error = "no DXBC container in the shader blob"; return false; }
+
+        var chunkCount = (int) BitConverter.ToUInt32(blob, containerStart + 28);
+        for (var i = 0; i < chunkCount; i++)
+        {
+            var chunkOffset = containerStart + (int) BitConverter.ToUInt32(blob, containerStart + 32 + i * 4);
+            var fourcc = FourCC(chunkOffset);
+            // OSGN: 24-byte elements; OSG1/OSG5: 32-byte elements led by a stream index
+            var stride = fourcc switch { "OSGN" => 24, "OSG1" or "OSG5" => 32, _ => 0 };
+            if (stride == 0) continue;
+
+            var dataStart = chunkOffset + 8;
+            var count = (int) BitConverter.ToUInt32(blob, dataStart);
+            for (var e = 0; e < count; e++)
+            {
+                var element = dataStart + 8 + e * stride;
+                var field = stride == 32 ? element + 4 : element; // skip the stream index
+                var nameOffset = (int) BitConverter.ToUInt32(blob, field);
+                var semanticIndex = (int) BitConverter.ToUInt32(blob, field + 4);
+                var systemValue = (int) BitConverter.ToUInt32(blob, field + 8);
+                var register = (int) BitConverter.ToUInt32(blob, field + 16);
+                var mask = blob[field + 20];
+
+                var nameStart = dataStart + nameOffset;
+                var nameEnd = nameStart;
+                while (nameEnd < blob.Length && blob[nameEnd] != 0) nameEnd++;
+                elements.Add((Encoding.ASCII.GetString(blob, nameStart, nameEnd - nameStart), semanticIndex, systemValue, register, mask));
+            }
+            return true;
+        }
+        error = "the shader has no output signature chunk";
+        return false;
+    }
+
+    public static PixelShaderWiring AnalyzeDxil(byte[] blob, FUniformExpressionSet expressionSet, EGame game, bool usesGBuffer,
+        EMaterialShadingModel shadingModel = EMaterialShadingModel.MSM_DefaultLit)
     {
         var wiring = new PixelShaderWiring();
         try
@@ -240,43 +703,8 @@ public static class MaterialPixelShaderAnalyzer
                 list.AddRange(DxilTaint.Taint(fn, resources, handles, valId, col));
             }
 
-            // float-offset in the preshader buffer -> uniform expression index (UE5 CreateBufferStruct)
-            var offsetMap = BuildPreshaderOffsetMap(expressionSet);
-
-            // Material cbuffer register = the cb whose loads land on preshader fields (validated, not guessed)
-            var cbHit = new Dictionary<int, int>();
-            foreach (var leaf in outLeaves.Values.SelectMany(v => v).Where(l => l.Kind == "cbuffer"))
-            {
-                var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
-                if (offsetMap.ContainsKey(off)) cbHit[leaf.Register] = cbHit.GetValueOrDefault(leaf.Register) + 1;
-            }
-            var materialReg = cbHit.Count > 0 ? cbHit.OrderByDescending(k => k.Value).First().Key : -1;
-
-            // texture registers via the UE D3D shader resource table prefix (identical layout to SM5)
-            var pos = 0;
-            ReadU32(blob, ref pos);
-            var srvMap = ReadResourceMap(blob, ref pos);
-            ReadResourceMap(blob, ref pos); // sampler
-            ReadResourceMap(blob, ref pos); // uav
-            ReadResourceMap(blob, ref pos); // layout hashes
-            var textureMap = ReadResourceMap(blob, ref pos);
-            var textureByRegister = materialReg >= 0
-                ? BuildTextureRegisterMap(expressionSet, materialReg, srvMap, textureMap)
-                : new Dictionary<long, (int Slot, int Index)>();
-
-            PixelValueSource? Resolve(DxLeaf leaf)
-            {
-                if (leaf.Kind == "cbuffer" && leaf.Register == materialReg)
-                {
-                    var off = leaf.Row * 4 + Math.Clamp(leaf.Component, 0, 3);
-                    if (offsetMap.TryGetValue(off, out var uni)) return PixelValueSource.Uniform(uni);
-                }
-                else if (leaf.Kind == "texture" && textureByRegister.TryGetValue(leaf.Register, out var tex))
-                {
-                    return PixelValueSource.Texture(tex.Slot, tex.Index, leaf.Component is >= 0 and <= 3 ? leaf.Component : -1);
-                }
-                return null;
-            }
+            // material cb / texture registers resolved the same way for every DXIL stage
+            var Resolve = BuildDxilResolve(blob, expressionSet, outLeaves.Values.SelectMany(v => v));
 
             void Add(string pin, PixelValueSource source)
             {
@@ -284,16 +712,52 @@ public static class MaterialPixelShaderAnalyzer
                 if (!l.Contains(source)) l.Add(source);
             }
 
+            // which target past MRT3 holds the custom data, from the same rules the SM5 path uses;
+            // DXIL stores tell us the written targets and their components
+            var dxilTargets = outLeaves.Keys.Select(k => k.Sig).DefaultIfEmpty(-1).Max() + 1;
+            var dxilMasks = new Dictionary<long, int>();
+            foreach (var (sig, col) in outLeaves.Keys)
+            {
+                dxilMasks.TryGetValue(sig, out var m);
+                dxilMasks[sig] = m | (1 << col);
+            }
+            var dxilByTarget = new Dictionary<int, HashSet<PixelValueSource>[]>();
+            foreach (var ((sig, col), leaves) in outLeaves)
+            {
+                if (!dxilByTarget.TryGetValue(sig, out var comps))
+                    dxilByTarget[sig] = comps = [[], [], [], []];
+                if (col is >= 0 and <= 3)
+                    foreach (var leaf in leaves)
+                        if (Resolve(leaf) is { } src) comps[col].Add(src);
+            }
+            var dxilRegToTarget = new Dictionary<long, int>();
+            for (var t = 0; t < dxilTargets; t++) dxilRegToTarget[t] = t;
+            var dxilLayout = ResolveGBufferLayout(dxilByTarget, dxilMasks, dxilRegToTarget);
+            wiring.GBufferLayout = dxilLayout.Description;
+
+            var customDataPins = new Dictionary<int, string>();
+            if (dxilLayout.CustomDataTarget >= 0)
+                MapCustomData(dxilLayout.CustomDataTarget, shadingModel,
+                    (_, first, last, pin) => { for (var c = first; c <= last; c++) customDataPins[c] = pin; });
+
             // UE deferred GBuffer layout (matches the SM5 MapSinksToPins mapping)
-            string PinFor(int sig, int col) => usesGBuffer
-                ? (sig, col) switch
+            string PinFor(int sig, int col)
+            {
+                if (!usesGBuffer)
+                    return (sig, col) switch { (0, 3) => "Opacity", (0, _) => "Emissive Color", _ => null };
+                if (sig == dxilLayout.CustomDataTarget && customDataPins.TryGetValue(col, out var customPin))
+                    return customPin;
+                if (sig == dxilLayout.TangentTarget)
+                    return col == 3 ? "Anisotropy" : "Tangent";
+                return (sig, col) switch
                 {
                     (1, _) => "Normal",
                     (2, 0) => "Metallic", (2, 1) => "Specular", (2, 2) => "Roughness",
+                    (2, 3) => shadingModel == EMaterialShadingModel.MSM_FromMaterialExpression ? "Shading Model" : null,
                     (3, 3) => "Ambient Occlusion", (3, _) => "Base Color",
                     _ => null
-                }
-                : (sig, col) switch { (0, 3) => "Opacity", (0, _) => "Emissive Color", _ => null };
+                };
+            }
 
             foreach (var ((sig, col), leaves) in outLeaves)
             {
@@ -502,7 +966,8 @@ public static class MaterialPixelShaderAnalyzer
 
     private static bool TryAnalyzeShader(FShader shader, string typeName, FShaderMapResourceCode code,
         Func<int, (byte[] Blob, string Error)> sharedCode,
-        FUniformExpressionSet expressionSet, bool usesGBuffer, PixelShaderWiring wiring, out string error)
+        FUniformExpressionSet expressionSet, bool usesGBuffer, EMaterialShadingModel shadingModel,
+        PixelShaderWiring wiring, out string error)
     {
         byte[] blob;
         if (code is { ShaderEntries.Length: > 0 })
@@ -618,7 +1083,8 @@ public static class MaterialPixelShaderAnalyzer
         };
         var (state, discardSink) = RunTaintAnalysis(instructions, context);
 
-        MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring);
+        MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring, shadingModel,
+            CollectOutputWriteMasks(instructions));
         try
         {
             BuildPinDisassemblies(instructions, context, outputRegToTarget, usesGBuffer, typeName, wiring);
@@ -725,7 +1191,8 @@ public static class MaterialPixelShaderAnalyzer
     /// (D3DShaderCompiler.cpp writes the same FD3D11ShaderResourceTable + DXBC stream).
     /// </summary>
     public static PixelShaderWiring AnalyzeLegacy(FMaterialShaderMapLegacy shaderMap, bool usesGBuffer,
-        Func<CUE4Parse.UE4.Objects.Core.Misc.FSHAHash, byte[]> sharedCodeResolver = null)
+        Func<CUE4Parse.UE4.Objects.Core.Misc.FSHAHash, byte[]> sharedCodeResolver = null,
+        EMaterialShadingModel shadingModel = EMaterialShadingModel.MSM_DefaultLit)
     {
         var wiring = new PixelShaderWiring();
         var expressionSet = shaderMap?.MaterialCompilationOutput?.UniformExpressionSet;
@@ -786,7 +1253,7 @@ public static class MaterialPixelShaderAnalyzer
             }
             try
             {
-                if (TryAnalyzeShaderLegacy(shader, blob, expressionSet, usesGBuffer, wiring, out var error))
+                if (TryAnalyzeShaderLegacy(shader, blob, expressionSet, usesGBuffer, shadingModel, wiring, out var error))
                 {
                     wiring.Success = true;
                     wiring.ShaderTypeName = shader.TypeName;
@@ -1180,7 +1647,7 @@ public static class MaterialPixelShaderAnalyzer
     }
 
     private static bool TryAnalyzeShaderLegacy(FShaderLegacy shader, byte[] blob, FUniformExpressionSetLegacy expressionSet,
-        bool usesGBuffer, PixelShaderWiring wiring, out string error)
+        bool usesGBuffer, EMaterialShadingModel shadingModel, PixelShaderWiring wiring, out string error)
     {
         var typeName = shader.TypeName; // blob is already Zlib-decompressed (inline via CUE4Parse, shared via the library lookup)
 
@@ -1240,7 +1707,8 @@ public static class MaterialPixelShaderAnalyzer
         };
         var (state, discardSink) = RunTaintAnalysis(instructions, context);
 
-        MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring);
+        MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring, shadingModel,
+            CollectOutputWriteMasks(instructions));
         try
         {
             BuildPinDisassemblies(instructions, context, outputRegToTarget, usesGBuffer, typeName, wiring);
@@ -2160,7 +2628,17 @@ public static class MaterialPixelShaderAnalyzer
                     components[c].UnionWith(union);
                 break;
             }
-            // null / depth outputs: nothing to track
+            case 12: // oDepth — SV_Depth, the sink of the material's Pixel Depth Offset
+            {
+                var components = state.GetOrAdd('d', 0);
+                var union = new HashSet<PixelValueSource>();
+                for (var c = 0; c < 4; c++)
+                    if (destination.Mask == 0 || (destination.Mask & (1 << c)) != 0)
+                        union.UnionWith(labels[c]);
+                components[0] = union;
+                break;
+            }
+            // null: nothing to track
         }
     }
 
@@ -2349,7 +2827,12 @@ public static class MaterialPixelShaderAnalyzer
         // strong per-lane update; all lanes resolve before any is written (mov r0.xy, r0.yx)
         void WriteDest(Operand dest, Func<int, ExprRef?> value)
         {
-            if (dest.Type is not (0 or 2)) return;
+            if (dest.Type is not (0 or 2 or 12)) return;
+            if (dest.Type == 12) // oDepth — the Pixel Depth Offset sink
+            {
+                state.GetOrAdd('d', 0)[0] = value(0);
+                return;
+            }
             var resolved = new ExprRef?[4];
             for (var c = 0; c < 4; c++)
                 if ((dest.Mask & (1 << c)) != 0)
@@ -2652,12 +3135,35 @@ public static class MaterialPixelShaderAnalyzer
             Root("Base Color", 3, 0b0111);
             Root("Ambient Occlusion", 3, 0b1000);
             Root("Emissive Color", 0, 0b0111);
+            // the optional targets, over the layout MapSinksToPins resolved for this shader
+            if (wiring.ShadingModel == EMaterialShadingModel.MSM_FromMaterialExpression)
+                Root("Shading Model", 2, 0b1000);
+            if (wiring.TangentTarget >= 0)
+            {
+                Root("Tangent", wiring.TangentTarget, 0b0111);
+                Root("Anisotropy", wiring.TangentTarget, 0b1000);
+            }
+            if (wiring.CustomDataTarget >= 0)
+            {
+                var customMasks = new Dictionary<string, int>();
+                MapCustomData(wiring.CustomDataTarget, wiring.ShadingModel, (_, first, last, pin) =>
+                {
+                    customMasks.TryGetValue(pin, out var mask);
+                    for (var c = first; c <= last; c++) mask |= 1 << c;
+                    customMasks[pin] = mask;
+                });
+                foreach (var (pin, mask) in customMasks)
+                    Root(pin, wiring.CustomDataTarget, mask);
+            }
         }
         else
         {
             Root("Emissive Color", 0, 0b0111);
             Root("Opacity", 0, 0b1000);
         }
+
+        if (state.Registers.TryGetValue(('d', 0L), out var depthWrite) && depthWrite[0] is { } depthRef)
+            results["Pixel Depth Offset"] = WrapRefs([depthRef]);
 
         if (discardConditions.Count == 1)
         {
@@ -2709,9 +3215,14 @@ public static class MaterialPixelShaderAnalyzer
     /// MRT2 GBufferB = metallic/specular/roughness, MRT3 GBufferC.rgb = base color with
     /// .a = ambient occlusion. Values reaching only scene color are emissive. Translucent
     /// materials render forward: MRT0.rgb = emissive+lit color, .a = opacity.
+    /// The optional targets past MRT3 (GBufferD custom data, GBufferF tangent/anisotropy,
+    /// velocity, GBufferE precomputed shadows) move around per cook — see
+    /// <see cref="ResolveGBufferLayout"/>, which only names the ones the written targets pin down.
     /// </summary>
     private static void MapSinksToPins(TaintState state, HashSet<PixelValueSource> discardSink,
-        Dictionary<long, int> outputRegToTarget, bool usesGBuffer, PixelShaderWiring wiring)
+        Dictionary<long, int> outputRegToTarget, bool usesGBuffer, PixelShaderWiring wiring,
+        EMaterialShadingModel shadingModel = EMaterialShadingModel.MSM_DefaultLit,
+        IReadOnlyDictionary<long, int> targetWriteMasks = null)
     {
         var byTarget = new Dictionary<int, HashSet<PixelValueSource>[]>();
         foreach (var (key, components) in state.Registers)
@@ -2745,6 +3256,28 @@ public static class MaterialPixelShaderAnalyzer
             AddComponents(3, 0, 2, "Base Color");
             AddComponents(3, 3, 3, "Ambient Occlusion");
 
+            // GBufferB.a packs the shading model id in its low 4 bits (GBufferInfo.cpp
+            // GBS_ShadingModelId → TargetGBufferB, bits 0..3); it only carries a material value
+            // when the material picks its shading model from an expression
+            if (shadingModel == EMaterialShadingModel.MSM_FromMaterialExpression)
+                AddComponents(2, 3, 3, "Shading Model");
+
+            var layout = ResolveGBufferLayout(byTarget, targetWriteMasks, outputRegToTarget);
+            wiring.GBufferLayout = layout.Description;
+            wiring.CustomDataTarget = layout.CustomDataTarget;
+            wiring.TangentTarget = layout.TangentTarget;
+            wiring.ShadingModel = shadingModel;
+
+            if (layout.TangentTarget >= 0)
+            {
+                // GBufferF: .rgb = world tangent, .a = anisotropy (GBufferInfo.cpp GBS_WorldTangent
+                // packs components 0..2, GBS_Anisotropy component 3, both on TargetGBufferF)
+                AddComponents(layout.TangentTarget, 0, 2, "Tangent");
+                AddComponents(layout.TangentTarget, 3, 3, "Anisotropy");
+            }
+            if (layout.CustomDataTarget >= 0)
+                MapCustomData(layout.CustomDataTarget, shadingModel, AddComponents);
+
             // scene color receives base color and metallic again through the lighting math,
             // so only values reaching no other pin are genuinely emissive
             if (byTarget.TryGetValue(0, out var sceneColor))
@@ -2767,9 +3300,115 @@ public static class MaterialPixelShaderAnalyzer
         if (discardSink.Count > 0)
             Add("Opacity Mask", discardSink);
 
+        // SV_Depth is written only by materials with a Pixel Depth Offset (BasePassPixelShader.usf
+        // writes OutDepth from GetMaterialPixelDepthOffset), so anything reaching it is that pin
+        if (state.Registers.TryGetValue(('d', 0L), out var depthComponents) && depthComponents[0].Count > 0)
+            Add("Pixel Depth Offset", depthComponents[0]);
+
         // drop pins that ended up with nothing so callers can treat presence as signal
         foreach (var pin in wiring.PinSources.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key).ToList())
             wiring.PinSources.Remove(pin);
+    }
+
+    /// <summary>
+    /// Which components each output register is ever written with, unioned over the decoded
+    /// program. A render target's width tells the layout resolver apart (velocity is the only
+    /// two-component GBuffer target), and it comes straight from the instruction masks.
+    /// </summary>
+    private static Dictionary<long, int> CollectOutputWriteMasks(List<Instruction> instructions)
+    {
+        var masks = new Dictionary<long, int>();
+        foreach (var instruction in instructions)
+        {
+            if (IsDeclarationOpcode(instruction.Opcode)) continue;
+            var destCount = TwoDestOpcodes.Contains(instruction.Opcode) ? 2 : 1;
+            for (var d = 0; d < destCount && d < instruction.Operands.Count; d++)
+            {
+                var operand = instruction.Operands[d];
+                if (operand.Type != 2) continue; // o# only
+                masks.TryGetValue(operand.Index0, out var current);
+                masks[operand.Index0] = current | operand.Mask;
+            }
+        }
+        return masks;
+    }
+
+    /// <summary>
+    /// Per-shading-model meaning of the GBufferD (custom data) components, transcribed from
+    /// ShadingModelsMaterial.ush SetGBufferForShadingModel: subsurface-style models put the
+    /// encoded Subsurface Color in .rgb, Clear Coat puts Custom Data 0/1 in .x/.y, Cloth puts
+    /// Custom Data 0 in .a, Hair in .z, Eye in .x/.w. Components the shader fills with something
+    /// other than a material input (packed normals, profile ids) are left unmapped.
+    /// </summary>
+    private static void MapCustomData(int target, EMaterialShadingModel shadingModel, Action<int, int, int, string> addComponents)
+    {
+        switch (shadingModel)
+        {
+            case EMaterialShadingModel.MSM_Subsurface:
+            case EMaterialShadingModel.MSM_PreintegratedSkin:
+            case EMaterialShadingModel.MSM_TwoSidedFoliage:
+                addComponents(target, 0, 2, "Subsurface Color");
+                break;
+            case EMaterialShadingModel.MSM_Cloth:
+                addComponents(target, 0, 2, "Subsurface Color");
+                addComponents(target, 3, 3, "Custom Data 0"); // cloth amount
+                break;
+            case EMaterialShadingModel.MSM_ClearCoat:
+                addComponents(target, 0, 0, "Custom Data 0"); // clear coat
+                addComponents(target, 1, 1, "Custom Data 1"); // clear coat roughness
+                break;
+            case EMaterialShadingModel.MSM_Hair:
+                addComponents(target, 2, 2, "Custom Data 0"); // backlit
+                break;
+            case EMaterialShadingModel.MSM_Eye:
+                addComponents(target, 3, 3, "Custom Data 0"); // iris mask (stored as 1 - mask)
+                break;
+            // SubsurfaceProfile stores a profile id, FromMaterialExpression varies per pixel:
+            // neither has a fixed custom-data component that a material input owns
+        }
+    }
+
+    /// <summary>
+    /// Names the optional GBuffer targets past MRT3 for this shader. Their order is decided at
+    /// cook time by GBUFFER_HAS_VELOCITY / GBUFFER_HAS_TANGENT / GBUFFER_HAS_PRECSHADOWFACTOR
+    /// (RenderCore GBufferInfo.cpp FetchLegacyGBufferInfo, whose three legal layouts are quoted in
+    /// that file's "4.25 Logic" comment), and those defines are not serialized with the material.
+    /// What IS in the shader is how many targets it writes and how wide each one is, which pins the
+    /// layout down in every case but one:
+    ///   • 5 targets  → 4 = GBufferD (the only layout with exactly five)
+    ///   • target 4 written ≤2 components → it is Velocity (GBT_Unorm_16_16), so 5 = GBufferD
+    ///   • target 5 carries material values → 5 = GBufferD, 4 = GBufferF (GBufferE holds
+    ///     precomputed shadow factors, which never come from material inputs)
+    ///   • otherwise → 4 = GBufferD, 5 = GBufferE
+    /// The last case is the only inference, and it is the layout the engine calls the default one;
+    /// the resolved names are reported in <see cref="PixelShaderWiring.GBufferLayout"/> so the UI
+    /// can show which reading produced the extra pins.
+    /// </summary>
+    private static (int CustomDataTarget, int TangentTarget, string Description) ResolveGBufferLayout(
+        Dictionary<int, HashSet<PixelValueSource>[]> byTarget,
+        IReadOnlyDictionary<long, int> targetWriteMasks,
+        Dictionary<long, int> outputRegToTarget)
+    {
+        var targetCount = outputRegToTarget.Count > 0 ? outputRegToTarget.Values.Max() + 1 : 0;
+        if (targetCount <= 4) return (-1, -1, $"{targetCount} render target(s): no custom-data target written");
+
+        if (targetCount == 5)
+            return (4, -1, "5 render targets: GBufferD at MRT4 (no velocity, tangent or precomputed-shadow target)");
+
+        // width of target 4 as the shader declares it: velocity is a two-component target
+        var mask4 = 0;
+        if (targetWriteMasks != null)
+            foreach (var (register, target) in outputRegToTarget)
+                if (target == 4 && targetWriteMasks.TryGetValue(register, out var m)) mask4 |= m;
+        var width4 = System.Numerics.BitOperations.PopCount((uint) mask4);
+        if (mask4 != 0 && width4 <= 2)
+            return (5, -1, $"{targetCount} render targets: MRT4 is the two-component velocity target, GBufferD at MRT5");
+
+        var target5HasMaterialValues = byTarget.TryGetValue(5, out var t5) && t5.Any(c => c.Count > 0);
+        if (target5HasMaterialValues)
+            return (5, 4, $"{targetCount} render targets: MRT5 carries material values so it is GBufferD, MRT4 is GBufferF (tangent/anisotropy)");
+
+        return (4, -1, $"{targetCount} render targets: GBufferD at MRT4, MRT5 treated as GBufferE (precomputed shadow factors)");
     }
 
     #endregion

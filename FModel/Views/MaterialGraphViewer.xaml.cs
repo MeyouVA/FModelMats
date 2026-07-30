@@ -692,10 +692,13 @@ public partial class MaterialGraphViewer
         Grid.SetRow(pinCanvas, 1);
         grid.Children.Add(pinCanvas);
 
+        // the editor fills a pin's socket only when something is plugged into it
+        var connectedIn = new HashSet<string>(_viewModel.Connections.Where(c => c.TargetNode == node).Select(c => c.TargetPinName));
+        var connectedOut = new HashSet<string>(_viewModel.Connections.Where(c => c.SourceNode == node).Select(c => c.SourcePinName));
         for (var i = 0; i < node.InputPins.Count; i++)
-            DrawPin(pinCanvas, node.InputPins[i], i, isOutput: false, width);
+            DrawPin(pinCanvas, node.InputPins[i], i, isOutput: false, width, connectedIn.Contains(node.InputPins[i].Name));
         for (var i = 0; i < node.OutputPins.Count; i++)
-            DrawPin(pinCanvas, node.OutputPins[i], i, isOutput: true, width);
+            DrawPin(pinCanvas, node.OutputPins[i], i, isOutput: true, width, connectedOut.Contains(node.OutputPins[i].Name));
 
         border.Child = grid;
         Canvas.SetLeft(border, node.NodePosX);
@@ -705,18 +708,20 @@ public partial class MaterialGraphViewer
         _nodeBorders[node] = border;
     }
 
-    private static void DrawPin(Canvas pinCanvas, MaterialGraphPin pin, int index, bool isOutput, double nodeWidth)
+    private static void DrawPin(Canvas pinCanvas, MaterialGraphPin pin, int index, bool isOutput, double nodeWidth, bool connected = true)
     {
         var y = index * PinRowHeight + PinRowHeight / 2;
         var pinColor = GetPinColor(pin.PinType);
 
+        // a pin this material cannot use is drawn dimmed and hollow, as the editor greys it out
         var circle = new Ellipse
         {
             Width = PinCircleRadius * 2,
             Height = PinCircleRadius * 2,
-            Fill = new SolidColorBrush(pinColor),
-            Stroke = new SolidColorBrush(Color.FromRgb(20, 20, 20)),
-            StrokeThickness = 1
+            Fill = connected ? new SolidColorBrush(pinColor) : Brushes.Transparent,
+            Stroke = new SolidColorBrush(pin.IsActive ? pinColor : Color.FromRgb(95, 95, 95)),
+            StrokeThickness = 1,
+            ToolTip = pin.IsActive ? null : $"{pin.Name} — inactive: {pin.InactiveReason}"
         };
         Canvas.SetLeft(circle, isOutput ? nodeWidth - PinCircleRadius : -PinCircleRadius);
         Canvas.SetTop(circle, y - PinCircleRadius);
@@ -725,10 +730,11 @@ public partial class MaterialGraphViewer
         var label = new TextBlock
         {
             Text = pin.Name,
-            Foreground = new SolidColorBrush(Color.FromRgb(210, 210, 210)),
+            Foreground = new SolidColorBrush(pin.IsActive ? Color.FromRgb(210, 210, 210) : Color.FromRgb(110, 110, 110)),
             FontSize = 10,
             MaxWidth = nodeWidth - PinLabelOffset * 2,
-            TextTrimming = TextTrimming.CharacterEllipsis
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            ToolTip = pin.IsActive ? null : $"Inactive: {pin.InactiveReason}"
         };
         label.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
         if (isOutput)

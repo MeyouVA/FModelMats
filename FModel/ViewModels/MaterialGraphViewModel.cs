@@ -56,6 +56,13 @@ public class MaterialGraphPin
     /// artist's material attribute inputs, so the user-graph classification skips them.
     /// </summary>
     public bool IsEngineStagePin { get; set; }
+    /// <summary>
+    /// False for a material output pin this material cannot use (the editor greys those out).
+    /// The pin is still drawn so the node shows the full attribute list.
+    /// </summary>
+    public bool IsActive { get; set; } = true;
+    /// <summary>Why an inactive pin is inactive, from the engine's property-active rules.</summary>
+    public string InactiveReason { get; set; } = string.Empty;
 }
 
 public class MaterialGraphConnection
@@ -895,7 +902,7 @@ public class MaterialGraphViewModel
             try
             {
                 wiring = MaterialPixelShaderAnalyzer.Analyze(shaderMap, expressionSet, usesGBufferPins,
-                    CreateSharedCodeResolver(shaderMap, shaderMapOwner));
+                    CreateSharedCodeResolver(shaderMap, shaderMapOwner), ResolveShadingModel(shaderMapOwner, parameters));
             }
             catch (Exception e)
             {
@@ -1003,7 +1010,7 @@ public class MaterialGraphViewModel
             if (blob == null) { lastError = error ?? lastError; continue; }
 
             PixelShaderWiring candidate;
-            try { candidate = MaterialPixelShaderAnalyzer.AnalyzeDxil(blob, expressionSet, game, usesGBuffer); }
+            try { candidate = MaterialPixelShaderAnalyzer.AnalyzeDxil(blob, expressionSet, game, usesGBuffer, ResolveShadingModel(shaderMapOwner, null)); }
             catch (Exception e) { lastError = e.Message; continue; }
 
             if (!candidate.Success) { lastError = candidate.FailureReason; continue; }
@@ -1012,7 +1019,54 @@ public class MaterialGraphViewModel
             if (best == null || candidate.PinSources.Count > best.PinSources.Count) best = candidate;
             if (best.PinSources.Count >= 5) break; // the base-pass PS wires the full GBuffer
         }
+
+        // World Position Offset is computed in the vertex shader, not the pixel shader
+        if (best is { Success: true })
+            WireWorldPositionOffsetDxil(content, expressionSet, provider, resourceHash, best);
         return best ?? new PixelShaderWiring { FailureReason = lastError };
+    }
+
+    /// <summary>
+    /// Adds the World Position Offset pin's sources from the base-pass VERTEX shader, the stage
+    /// that actually evaluates WPO. Vertex shaders are tried richest-first and the first one whose
+    /// position output provably carries material values wins; a material without WPO simply leaves
+    /// the pin unwired, as before.
+    /// </summary>
+    private static void WireWorldPositionOffsetDxil(FMaterialShaderMapContent content, FUniformExpressionSet expressionSet,
+        IVfsFileProvider provider, FSHAHash resourceHash, PixelShaderWiring wiring)
+    {
+        var vertexShaders = new List<FShader>();
+        void Collect(FShader[] shaders)
+        {
+            foreach (var shader in shaders ?? [])
+                if (shader?.Target.Frequency == EShaderFrequency.SF_Vertex)
+                    vertexShaders.Add(shader);
+        }
+        Collect(content.Shaders);
+        foreach (var mesh in content.OrderedMeshShaderMaps ?? [])
+            Collect(mesh.Shaders);
+
+        foreach (var shader in vertexShaders.OrderByDescending(s => s.NumInstructions).Take(6))
+        {
+            if (!MaterialPixelShaderAnalyzer.TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
+            {
+                wiring.WorldPositionOffsetNote ??= slotReason;
+                continue;
+            }
+            var blob = MaterialDxilLibrary.TryGetShaderCode(provider, resourceHash, shader.ResourceIndex, out _);
+            if (blob == null) continue;
+            var sources = MaterialPixelShaderAnalyzer.AnalyzeDxilWorldPositionOffset(blob, expressionSet, materialSlot,
+                out var error, out var expression);
+            if (sources == null)
+            {
+                wiring.WorldPositionOffsetNote ??= error;
+                continue;
+            }
+            wiring.PinSources["World Position Offset"] = sources;
+            if (expression != null) wiring.PinExpressions["World Position Offset"] = expression;
+            wiring.WorldPositionOffsetNote = "recovered from the base-pass vertex shader's position output";
+            return;
+        }
     }
 
     /// <summary>
@@ -1027,6 +1081,12 @@ public class MaterialGraphViewModel
         Dictionary<(int Slot, int Index), MaterialGraphNode> textureNodesBySlot)
     {
         CanExpandPixelShaderMath = wiring.PinExpressions.Count > 0 || wiring.ShaderStages.Any(s => s.OutputExpressions.Count > 0);
+        // how the optional GBuffer targets were named — the reading behind the custom-data pins
+        if (!string.IsNullOrEmpty(wiring.GBufferLayout))
+            outputNode.DisplayProperties.Add(new KeyValuePair<string, string>("GBuffer Layout", wiring.GBufferLayout));
+        // WPO comes from the vertex stage, so its outcome is reported separately
+        if (!string.IsNullOrEmpty(wiring.WorldPositionOffsetNote))
+            outputNode.DisplayProperties.Add(new KeyValuePair<string, string>("World Position Offset", wiring.WorldPositionOffsetNote));
         _otherStageWiredValues = 0;
         _otherStageNodeCount = 0;
         _otherStageExpandedCount = 0;
@@ -1124,12 +1184,13 @@ public class MaterialGraphViewModel
         return wired;
     }
 
-    private static readonly string[] StandardMaterialOutputPins =
-    [
-        "Base Color", "Metallic", "Specular", "Roughness", "Emissive Color", "Opacity", "Opacity Mask",
-        "Normal", "World Position Offset", "Ambient Occlusion", "Refraction", "Pixel Depth Offset",
-        "Subsurface Color", "Clear Coat", "Clear Coat Roughness", "Anisotropy", "Tangent"
-    ];
+    // built on first use: MaterialOutputPinOrder is declared further down, so a field initializer
+    // here would run before it and see null
+    private static string[] _standardMaterialOutputPins;
+    private static string[] StandardMaterialOutputPins => _standardMaterialOutputPins ??=
+        MaterialOutputPinOrder.Select(p => p.Name)
+            .Concat(["Clear Coat", "Clear Coat Roughness"]) // editor names of the Clear Coat custom data pins
+            .ToArray();
 
     /// <summary>Appends the shader-map overview sentence describing the stage nodes added this build.</summary>
     private void AppendShaderStageNote(StringBuilder note)
@@ -1815,7 +1876,7 @@ public class MaterialGraphViewModel
                 catch { /* display-only data */ }
             }
             var usesGBuffer = parameters.BlendMode is EBlendMode.BLEND_Opaque or EBlendMode.BLEND_Masked;
-            var wiring = MaterialPixelShaderAnalyzer.AnalyzeLegacy(shaderMap, usesGBuffer, CreateLegacyShaderCodeResolver(chain));
+            var wiring = MaterialPixelShaderAnalyzer.AnalyzeLegacy(shaderMap, usesGBuffer, CreateLegacyShaderCodeResolver(chain), ResolveShadingModel(chain[0], parameters));
             if (!wiring.Success) return;
 
             foreach (var (pinName, code) in wiring.PinDisassembly.OrderBy(p => p.Key))
@@ -2003,7 +2064,7 @@ public class MaterialGraphViewModel
         try
         {
             var usesGBuffer = parameters.BlendMode is EBlendMode.BLEND_Opaque or EBlendMode.BLEND_Masked;
-            wiring = MaterialPixelShaderAnalyzer.AnalyzeLegacy(shaderMap, usesGBuffer, CreateLegacyShaderCodeResolver(chain));
+            wiring = MaterialPixelShaderAnalyzer.AnalyzeLegacy(shaderMap, usesGBuffer, CreateLegacyShaderCodeResolver(chain), ResolveShadingModel(chain[0], parameters));
         }
         catch (Exception e)
         {
@@ -2651,23 +2712,281 @@ public class MaterialGraphViewModel
 
     #region Shared helpers
 
+    /// <summary>
+    /// The material output node's full attribute pin list, in the editor's order. Every pin the
+    /// editor draws is drawn here too; a pin the material cannot use is kept and marked inactive
+    /// (the editor greys those out) rather than hidden, so the node reads like the editor's.
+    /// Active/inactive comes from <see cref="IsMaterialPropertyActive"/>, which follows the
+    /// engine's own rule table, over the material's serialized settings.
+    /// </summary>
     private void AddStandardOutputPins(MaterialGraphNode outputNode, UMaterialInterface material, CMaterialParams2 parameters = null)
     {
-        var blendMode = parameters?.BlendMode
-                        ?? (material as UMaterial)?.BlendMode
-                        ?? EBlendMode.BLEND_Opaque;
+        var settings = MaterialOutputSettings.From(material, parameters);
+        foreach (var (name, pinType) in MaterialOutputPinOrder)
+        {
+            if (!settings.SupportsProperty(name)) continue; // property that this engine version has no input for
+            var active = IsMaterialPropertyActive(name, settings, out var reason);
+            outputNode.InputPins.Add(new MaterialGraphPin
+            {
+                Name = name,
+                PinType = pinType,
+                IsActive = active,
+                InactiveReason = active ? string.Empty : reason
+            });
+        }
+        outputNode.DisplayProperties.Add(new KeyValuePair<string, string>("Output Pins", settings.Describe()));
+    }
 
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Base Color", PinType = "color" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Metallic", PinType = "float" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Specular", PinType = "float" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Roughness", PinType = "float" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Emissive Color", PinType = "color" });
-        if (blendMode is EBlendMode.BLEND_Translucent or EBlendMode.BLEND_Additive or EBlendMode.BLEND_Modulate or EBlendMode.BLEND_AlphaComposite or EBlendMode.BLEND_AlphaHoldout)
-            outputNode.InputPins.Add(new MaterialGraphPin { Name = "Opacity", PinType = "float" });
-        if (blendMode is EBlendMode.BLEND_Masked)
-            outputNode.InputPins.Add(new MaterialGraphPin { Name = "Opacity Mask", PinType = "float" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Normal", PinType = "vector" });
-        outputNode.InputPins.Add(new MaterialGraphPin { Name = "Ambient Occlusion", PinType = "float" });
+    /// <summary>
+    /// The shading model the GBuffer encoding was compiled for — the same resolution the output
+    /// pins use, so the custom-data mapping and the pin states cannot disagree.
+    /// </summary>
+    private static EMaterialShadingModel ResolveShadingModel(UMaterialInterface material, CMaterialParams2 parameters)
+        => MaterialOutputSettings.From(material, parameters).ShadingModel;
+
+    /// <summary>
+    /// Material attribute inputs in the order UMaterial declares them (Material.h / the editor's
+    /// output node): the pin list is fixed, only the enabled state varies per material.
+    /// </summary>
+    private static readonly (string Name, string PinType)[] MaterialOutputPinOrder =
+    [
+        ("Base Color", "color"), ("Metallic", "float"), ("Specular", "float"), ("Roughness", "float"),
+        ("Anisotropy", "float"), ("Emissive Color", "color"), ("Opacity", "float"), ("Opacity Mask", "float"),
+        ("Normal", "vector"), ("Tangent", "vector"), ("World Position Offset", "vector"),
+        ("World Displacement", "vector"), ("Tessellation Multiplier", "float"),
+        ("Subsurface Color", "color"), ("Custom Data 0", "float"), ("Custom Data 1", "float"),
+        ("Ambient Occlusion", "float"), ("Refraction", "float"), ("Pixel Depth Offset", "float"),
+        ("Shading Model", "float")
+    ];
+
+    /// <summary>
+    /// The serialized material settings the engine's property-active rules read. Values come from
+    /// the material export (or, for an instance, from <see cref="CMaterialParams2"/>, which already
+    /// resolved the parent chain); anything a cooked asset does not serialize keeps the engine's
+    /// own default and is named in <see cref="Describe"/> so the reading stays visible.
+    /// </summary>
+    private sealed class MaterialOutputSettings
+    {
+        public EBlendMode BlendMode = EBlendMode.BLEND_Opaque;
+        /// <summary>
+        /// Every shading model this material can take, as the engine's FMaterialShadingModelField
+        /// records them. A cooked asset that never changed the default serializes nothing, and the
+        /// engine's own default (UMaterial constructor, Material.cpp) is Default Lit — not Unlit.
+        /// </summary>
+        public readonly HashSet<EMaterialShadingModel> ShadingModels = [];
+        public EMaterialShadingModel ShadingModel = EMaterialShadingModel.MSM_DefaultLit;
+        public ETranslucencyLightingMode TranslucencyLightingMode = ETranslucencyLightingMode.TLM_VolumetricNonDirectional;
+        public string Domain = "MD_Surface";
+        /// <summary>UE4 D3D11 tessellation mode; UE5 removed tessellation and the two pins with it.</summary>
+        public string TessellationMode;
+        public bool IsUe4;
+        /// <summary>How the shading model was determined, for the node's evidence row.</summary>
+        public string ShadingModelSource = "engine default (not serialized)";
+
+        public static MaterialOutputSettings From(UMaterialInterface material, CMaterialParams2 parameters)
+        {
+            var settings = new MaterialOutputSettings();
+            var asMaterial = material as UMaterial;
+            settings.BlendMode = parameters?.BlendMode ?? asMaterial?.BlendMode ?? settings.BlendMode;
+            if (asMaterial != null) settings.TranslucencyLightingMode = asMaterial.TranslucencyLightingMode;
+            settings.IsUe4 = material.Owner?.Provider?.Versions.Game < EGame.GAME_UE5_0;
+
+            // 4.25+ serializes the whole field; older assets the single enum. CMaterialParams2 is
+            // the fallback because it resolves an instance's parent chain.
+            if (material.TryGetValue(out FStructFallback field, "ShadingModels") &&
+                field.TryGetValue(out ushort bits, "ShadingModelField") && bits != 0)
+            {
+                for (var i = 0; i < 16; i++)
+                    if ((bits & (1 << i)) != 0)
+                        settings.ShadingModels.Add((EMaterialShadingModel) i);
+                settings.ShadingModelSource = "serialized ShadingModels field";
+            }
+            else if (material.TryGetValue(out FName single, "ShadingModel") && !single.IsNone &&
+                     Enum.TryParse<EMaterialShadingModel>(single.Text, out var parsed))
+            {
+                settings.ShadingModels.Add(parsed);
+                settings.ShadingModelSource = "serialized ShadingModel";
+            }
+            else if (parameters is { ShadingModel: not EMaterialShadingModel.MSM_Unlit })
+            {
+                settings.ShadingModels.Add(parameters.ShadingModel);
+                settings.ShadingModelSource = "material instance chain";
+            }
+            else settings.ShadingModels.Add(EMaterialShadingModel.MSM_DefaultLit);
+
+            settings.ShadingModel = settings.ShadingModels.Contains(EMaterialShadingModel.MSM_FromMaterialExpression)
+                ? EMaterialShadingModel.MSM_FromMaterialExpression
+                : settings.ShadingModels.First();
+
+            if (material.TryGetValue(out FName tessellation, "D3D11TessellationMode") && !tessellation.IsNone)
+                settings.TessellationMode = tessellation.Text;
+            return settings;
+        }
+
+        /// <summary>Whether this engine version has the pin at all (tessellation is UE4-only).</summary>
+        public bool SupportsProperty(string name) =>
+            name is not ("World Displacement" or "Tessellation Multiplier") || IsUe4;
+
+        public bool HasAnyShadingModel(params EMaterialShadingModel[] models) => models.Any(ShadingModels.Contains);
+
+        public bool IsTranslucentBlend => BlendMode is EBlendMode.BLEND_Translucent or EBlendMode.BLEND_Additive
+            or EBlendMode.BLEND_Modulate or EBlendMode.BLEND_AlphaComposite or EBlendMode.BLEND_AlphaHoldout;
+
+        /// <summary>FMaterialShadingModelField::IsLit — lit unless the only model is Unlit.</summary>
+        public bool IsLit => ShadingModels.Any(m => m != EMaterialShadingModel.MSM_Unlit);
+
+        public bool IsVolumetricTranslucencyLighting => TranslucencyLightingMode
+            is ETranslucencyLightingMode.TLM_VolumetricNonDirectional or ETranslucencyLightingMode.TLM_VolumetricDirectional
+            or ETranslucencyLightingMode.TLM_VolumetricPerVertexNonDirectional or ETranslucencyLightingMode.TLM_VolumetricPerVertexDirectional;
+
+        public bool IsNonDirectionalTranslucencyLighting => TranslucencyLightingMode
+            is ETranslucencyLightingMode.TLM_VolumetricNonDirectional or ETranslucencyLightingMode.TLM_VolumetricPerVertexNonDirectional;
+
+        public string Describe()
+        {
+            var models = string.Join("+", ShadingModels);
+            var text = $"{Domain}, {BlendMode}, {models} ({ShadingModelSource})";
+            if (TessellationMode != null) text += $", {TessellationMode}";
+            return text + " — enabled pins follow UMaterial::IsPropertyActive";
+        }
+    }
+
+    /// <summary>
+    /// Whether a material output pin is active, transcribed from IsPropertyActive_Internal
+    /// (Engine/Private/Materials/Material.cpp): the same switch over domain, blend mode, shading
+    /// model and translucency lighting mode the editor uses to grey pins out. Two inputs are not
+    /// serialized into cooked assets — whether Refraction is connected (bHasRefraction) and whether
+    /// translucency writes velocity — so pins gated on those are reported as inactive with the
+    /// reason naming the missing information instead of being guessed active.
+    /// </summary>
+    private static bool IsMaterialPropertyActive(string pin, MaterialOutputSettings s, out string reason)
+    {
+        reason = string.Empty;
+        var subsurfaceModels = s.HasAnyShadingModel(EMaterialShadingModel.MSM_Subsurface,
+            EMaterialShadingModel.MSM_PreintegratedSkin, EMaterialShadingModel.MSM_SubsurfaceProfile,
+            EMaterialShadingModel.MSM_TwoSidedFoliage, EMaterialShadingModel.MSM_Cloth,
+            EMaterialShadingModel.MSM_Eye);
+
+        // non-surface domains keep only a small subset of the inputs
+        switch (s.Domain)
+        {
+            case "MD_PostProcess":
+                if (pin == "Emissive Color") return true;
+                reason = "the material domain is Post Process, which only uses Emissive Color";
+                return false;
+            case "MD_LightFunction":
+                if (pin == "Emissive Color") return true;
+                reason = "the material domain is Light Function, which only uses Emissive Color";
+                return false;
+            case "MD_Volume":
+                if (pin is "Emissive Color" or "Subsurface Color" or "Base Color" or "Ambient Occlusion") return true;
+                reason = "the material domain is Volume";
+                return false;
+            case "MD_UI":
+                if (pin is "Emissive Color" or "World Position Offset") return true;
+                if (pin == "Opacity Mask" && s.BlendMode == EBlendMode.BLEND_Masked) return true;
+                if (pin == "Opacity" && s.IsTranslucentBlend && s.BlendMode != EBlendMode.BLEND_Modulate) return true;
+                reason = "the material domain is User Interface";
+                return false;
+            case "MD_DeferredDecal":
+                if (pin == "World Position Offset") return true;
+                if (s.BlendMode is EBlendMode.BLEND_Translucent)
+                {
+                    if (pin is "Emissive Color" or "Normal" or "Metallic" or "Specular" or "Base Color" or "Roughness" or "Opacity" or "Ambient Occlusion") return true;
+                }
+                else if (s.BlendMode is EBlendMode.BLEND_AlphaComposite)
+                {
+                    if (pin is "Emissive Color" or "Metallic" or "Specular" or "Base Color" or "Roughness" or "Opacity") return true;
+                }
+                else if (s.BlendMode is EBlendMode.BLEND_Modulate)
+                {
+                    if (pin is "Emissive Color" or "Normal" or "Metallic" or "Specular" or "Base Color" or "Roughness" or "Opacity") return true;
+                }
+                reason = $"the material domain is Deferred Decal with blend mode {s.BlendMode}";
+                return false;
+        }
+
+        switch (pin)
+        {
+            case "Refraction":
+                // (translucent, non-holdout, non-modulate) or single layer water; whether the input
+                // is actually connected is editor-only data that cooking drops
+                if ((s.IsTranslucentBlend && s.BlendMode is not (EBlendMode.BLEND_AlphaHoldout or EBlendMode.BLEND_Modulate))
+                    || s.HasAnyShadingModel(EMaterialShadingModel.MSM_SingleLayerWater)) return true;
+                reason = "Refraction needs a translucent blend mode (or Single Layer Water)";
+                return false;
+            case "Opacity":
+                if (subsurfaceModels) return true;
+                if ((s.IsTranslucentBlend && s.BlendMode != EBlendMode.BLEND_Modulate)
+                    || s.HasAnyShadingModel(EMaterialShadingModel.MSM_SingleLayerWater)) return true;
+                reason = "Opacity needs a translucent blend mode, a subsurface shading model or Single Layer Water";
+                return false;
+            case "Opacity Mask":
+                if (s.BlendMode == EBlendMode.BLEND_Masked) return true;
+                reason = "Opacity Mask needs the Masked blend mode";
+                return false;
+            case "Base Color":
+            case "Ambient Occlusion":
+                if (s.IsLit) return true;
+                reason = $"{pin} is unused by the Unlit shading model";
+                return false;
+            case "Metallic":
+            case "Specular":
+            case "Roughness":
+                if (s.IsLit && (!s.IsTranslucentBlend || !s.IsVolumetricTranslucencyLighting)) return true;
+                reason = s.IsLit
+                    ? $"{pin} is unused with volumetric translucency lighting"
+                    : $"{pin} is unused by the Unlit shading model";
+                return false;
+            case "Anisotropy":
+            case "Tangent":
+                if (s.HasAnyShadingModel(EMaterialShadingModel.MSM_DefaultLit, EMaterialShadingModel.MSM_ClearCoat)
+                    && (!s.IsTranslucentBlend || !s.IsVolumetricTranslucencyLighting)) return true;
+                reason = $"{pin} needs the Default Lit or Clear Coat shading model";
+                return false;
+            case "Normal":
+                if (s.IsLit && (!s.IsTranslucentBlend || !s.IsNonDirectionalTranslucencyLighting)) return true;
+                reason = "Normal is unused by this shading model and lighting mode (unless Refraction is connected, which cooking does not record)";
+                return false;
+            case "Subsurface Color":
+                if (s.HasAnyShadingModel(EMaterialShadingModel.MSM_Subsurface, EMaterialShadingModel.MSM_PreintegratedSkin,
+                    EMaterialShadingModel.MSM_TwoSidedFoliage, EMaterialShadingModel.MSM_Cloth)) return true;
+                reason = "Subsurface Color needs a Subsurface, Preintegrated Skin, Two Sided Foliage or Cloth shading model";
+                return false;
+            case "Custom Data 0":
+                if (s.HasAnyShadingModel(EMaterialShadingModel.MSM_ClearCoat, EMaterialShadingModel.MSM_Hair,
+                    EMaterialShadingModel.MSM_Cloth, EMaterialShadingModel.MSM_Eye,
+                    EMaterialShadingModel.MSM_SubsurfaceProfile)) return true;
+                reason = "Custom Data 0 needs a Clear Coat, Hair, Cloth, Eye or Subsurface Profile shading model";
+                return false;
+            case "Custom Data 1":
+                if (s.HasAnyShadingModel(EMaterialShadingModel.MSM_ClearCoat, EMaterialShadingModel.MSM_Eye)) return true;
+                reason = "Custom Data 1 needs a Clear Coat or Eye shading model";
+                return false;
+            case "Emissive Color":
+                if (s.BlendMode != EBlendMode.BLEND_AlphaHoldout) return true;
+                reason = "Emissive Color is unused with the Alpha Holdout blend mode";
+                return false;
+            case "World Position Offset":
+                return true;
+            case "Pixel Depth Offset":
+                if (!s.IsTranslucentBlend) return true;
+                reason = "Pixel Depth Offset needs an opaque or masked blend mode (or translucency writing velocity, which cooking does not record)";
+                return false;
+            case "Shading Model":
+                if (s.HasAnyShadingModel(EMaterialShadingModel.MSM_FromMaterialExpression) || s.ShadingModels.Count > 1) return true;
+                reason = "Shading Model is only an input when the material picks its shading model from an expression";
+                return false;
+            case "World Displacement":
+            case "Tessellation Multiplier":
+                // UE4 only: MP_WorldDisplacement/MP_TessellationMultiplier are gated on the
+                // material's D3D11TessellationMode (Material.cpp, pre-5.0 IsPropertyActive)
+                if (s.TessellationMode is not (null or "MTM_NoTessellation")) return true;
+                reason = "tessellation is disabled on this material";
+                return false;
+            default:
+                return true;
+        }
     }
 
     /// <summary>

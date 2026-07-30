@@ -741,6 +741,10 @@ internal sealed class DxResource
     public int Register;
     public int RangeSize;
     public int ResClass; // 0 SRV, 1 UAV, 2 CBV, 3 Sampler
+    /// <summary>Resource name from the DXIL metadata; UE's cooked shaders usually strip it.</summary>
+    public string Name;
+    /// <summary>Declared size of a constant buffer, in bytes (-1 for other resource classes).</summary>
+    public int SizeInBytes = -1;
 }
 
 internal struct DxBinding { public int ResClass; public int Space; public int Register; public int ResId; }
@@ -774,6 +778,10 @@ internal static class DxilTaint
                 {
                     ResClass = cls,
                     Id = (int) (ConstFromMd(m, res[0]) ?? -1),
+                    // [2] is the resource's name string — UE names the material uniform buffer "Material"
+                    Name = res[2] >= 0 && res[2] < m.Md.Count && m.Md[res[2]].Kind == MdKind.String ? m.Md[res[2]].Str : null,
+                    // cbuffers carry their declared byte size at index 6
+                    SizeInBytes = cls == 2 && res.Count > 6 ? (int) (ConstFromMd(m, res[6]) ?? -1) : -1,
                     Space = (int) (ConstFromMd(m, res[3]) ?? -1),
                     Register = (int) (ConstFromMd(m, res[4]) ?? -1),
                     RangeSize = (int) (ConstFromMd(m, res[5]) ?? 1),
