@@ -894,7 +894,8 @@ public class MaterialGraphViewModel
         {
             try
             {
-                wiring = MaterialPixelShaderAnalyzer.Analyze(shaderMap, expressionSet, usesGBufferPins);
+                wiring = MaterialPixelShaderAnalyzer.Analyze(shaderMap, expressionSet, usesGBufferPins,
+                    CreateSharedCodeResolver(shaderMap, shaderMapOwner));
             }
             catch (Exception e)
             {
@@ -945,6 +946,26 @@ public class MaterialGraphViewModel
 
         ApplyInstanceOverrides(chain);
         FinalizeReconstructedGraph(layoutRoots);
+    }
+
+    /// <summary>
+    /// Bytecode source for shader maps that share their code instead of inlining it: games cooked
+    /// with r.ShaderCodeLibrary.Enable serialize a ResourceHash and move the shaders into
+    /// ShaderArchive-*.ushaderbytecode. Returns null when the map inlines its code or the game
+    /// ships no such library, which leaves the inline path exactly as it was.
+    /// </summary>
+    private static Func<int, (byte[] Blob, string Error)> CreateSharedCodeResolver(FMaterialShaderMap shaderMap, UMaterialInterface shaderMapOwner)
+    {
+        if (shaderMap?.Code is { ShaderEntries.Length: > 0 }) return null;
+        if (shaderMap?.ResourceHash is not { } resourceHash) return null;
+        if (shaderMapOwner?.Owner?.Provider is not { } provider) return null;
+        if (!MaterialPakShaderLibrary.HasLibrary(provider)) return null;
+
+        return index =>
+        {
+            var blob = MaterialPakShaderLibrary.TryGetShaderCode(provider, resourceHash, index, out var error);
+            return (blob, error);
+        };
     }
 
     /// <summary>

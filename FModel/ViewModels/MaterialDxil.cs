@@ -106,6 +106,7 @@ internal static class MaterialDxilLibrary
     /// dx.op intrinsics it uses. Everything comes from the decoded bitstream — no invented text.
     /// A full LLVM-IR disassembly is out of scope; this describes what the analyzer actually reads.
     /// </summary>
+    /// <remarks>The UE4 pak-cooked counterpart of the retrieval above lives in <see cref="MaterialPakShaderLibrary"/>.</remarks>
     public static string Describe(byte[] blob)
     {
         var sb = new StringBuilder();
@@ -1053,4 +1054,76 @@ internal static class DxilTaint
     private static long? ConstOfValue(DxFunction fn, int id) { var v = ValById(fn, id); return v is { HasConstInt: true } ? v.ConstInt : null; }
     private static long? ConstOperand(DxFunction fn, DxInstr instr, int opIdx) => opIdx < instr.Operands.Count ? ConstOfValue(fn, instr.Operands[opIdx]) : null;
     public static long? ConstOp(DxFunction fn, DxInstr instr, int opIdx) => ConstOperand(fn, instr, opIdx);
+}
+
+/// <summary>
+/// Retrieves a shader's compiled bytecode from a UE4 pak-cooked shared shader library
+/// (<c>ShaderArchive-*.ushaderbytecode</c>, ShaderCodeArchive.cpp version 2 =
+/// <see cref="FSerializedShaderArchive"/>). Games that cook with
+/// <c>r.ShaderCodeLibrary.Enable</c> keep the material's shader map in the package but move the
+/// bytecode into these libraries, so the map serializes a ResourceHash instead of inline code.
+/// Resolution mirrors FShaderMapResource_SharedCode: ResourceHash → shader-map index →
+/// ShaderIndices[FirstIndex + in-map index] → the global shader entry and its code blob.
+/// Everything is read 1:1 from the serialized library.
+/// </summary>
+internal static class MaterialPakShaderLibrary
+{
+    private static readonly ConditionalWeakTable<CUE4Parse.FileProvider.IFileProvider, List<FShaderCodeArchive>> _cache = new();
+
+    private static List<FShaderCodeArchive> GetLibraries(CUE4Parse.FileProvider.IFileProvider provider)
+    {
+        if (_cache.TryGetValue(provider, out var cached)) return cached;
+        var libs = new List<FShaderCodeArchive>();
+        foreach (var (path, file) in provider.Files)
+        {
+            if (!path.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                var archive = new FShaderCodeArchive(new FByteArchive(path, file.Read(), provider.Versions));
+                if (archive.SerializedShaders is FSerializedShaderArchive) libs.Add(archive);
+            }
+            catch { /* an unreadable library only disables pixel-shader wiring */ }
+        }
+        _cache.Add(provider, libs);
+        return libs;
+    }
+
+    /// <summary>Whether this provider has any pak-cooked shared shader library at all.</summary>
+    public static bool HasLibrary(CUE4Parse.FileProvider.IFileProvider provider) =>
+        provider != null && provider.Files.Keys.Any(k => k.EndsWith(".ushaderbytecode", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// The decompressed bytecode of the shader at <paramref name="resourceIndex"/> within the
+    /// shader map identified by <paramref name="resourceHash"/>, or null with the reason.
+    /// </summary>
+    public static byte[] TryGetShaderCode(CUE4Parse.FileProvider.IFileProvider provider, FSHAHash resourceHash, int resourceIndex, out string error)
+    {
+        error = null;
+        var libs = GetLibraries(provider);
+        if (libs.Count == 0) { error = "no pak-cooked shader library could be read"; return null; }
+
+        foreach (var archive in libs)
+        {
+            var lib = (FSerializedShaderArchive) archive.SerializedShaders;
+            var mapIdx = Array.IndexOf(lib.ShaderMapHashes, resourceHash);
+            if (mapIdx < 0) continue;
+
+            var mapEntry = lib.ShaderMapEntries[mapIdx];
+            if (resourceIndex < 0 || resourceIndex >= mapEntry.NumShaders) { error = "shader index out of the map's range"; return null; }
+
+            var gIdx = (int) lib.ShaderIndices[(int) mapEntry.ShaderIndicesOffset + resourceIndex];
+            if (gIdx < 0 || gIdx >= archive.ShaderCode.Length) { error = "shader entry out of the library's range"; return null; }
+
+            var entry = lib.ShaderEntries[gIdx];
+            var bytes = archive.ShaderCode[gIdx];
+            if (bytes == null || bytes.Length == 0) { error = "the library entry is empty"; return null; }
+
+            // entries are LZ4 compressed unless they came out the same size (ShaderCodeArchive.cpp)
+            if (entry.Size == entry.UncompressedSize) return bytes;
+            try { return Compression.Decompress(bytes, (int) entry.UncompressedSize, CompressionMethod.LZ4); }
+            catch (Exception e) { error = $"the library entry could not be decompressed ({e.Message})"; return null; }
+        }
+        error = "this material's shader map was not found in any shader library";
+        return null;
+    }
 }

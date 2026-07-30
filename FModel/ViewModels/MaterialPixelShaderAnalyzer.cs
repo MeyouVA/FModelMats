@@ -149,11 +149,17 @@ public static class MaterialPixelShaderAnalyzer
 {
     #region Public entry point
 
-    public static PixelShaderWiring Analyze(FMaterialShaderMap shaderMap, FUniformExpressionSet expressionSet, bool usesGBuffer)
+    /// <param name="sharedCode">
+    /// Supplies a shader's decompressed bytecode by its in-map resource index when the shader map
+    /// shares code instead of inlining it (games cooked with r.ShaderCodeLibrary.Enable). Null when
+    /// the caller has no library to read, which keeps the previous inline-only behaviour.
+    /// </param>
+    public static PixelShaderWiring Analyze(FMaterialShaderMap shaderMap, FUniformExpressionSet expressionSet, bool usesGBuffer,
+        Func<int, (byte[] Blob, string Error)> sharedCode = null)
     {
         var wiring = new PixelShaderWiring();
         var code = shaderMap?.Code;
-        if (code == null || code.ShaderEntries.Length == 0)
+        if ((code == null || code.ShaderEntries.Length == 0) && sharedCode == null)
         {
             wiring.FailureReason = "compiled shader code is not inlined (stored in the shared shader library)";
             return wiring;
@@ -176,7 +182,7 @@ public static class MaterialPixelShaderAnalyzer
         {
             try
             {
-                if (TryAnalyzeShader(shader, typeName, code, expressionSet, usesGBuffer, wiring, out var error))
+                if (TryAnalyzeShader(shader, typeName, code, sharedCode, expressionSet, usesGBuffer, wiring, out var error))
                 {
                     wiring.Success = true;
                     wiring.ShaderTypeName = typeName;
@@ -495,24 +501,40 @@ public static class MaterialPixelShaderAnalyzer
     #region Per-shader analysis
 
     private static bool TryAnalyzeShader(FShader shader, string typeName, FShaderMapResourceCode code,
+        Func<int, (byte[] Blob, string Error)> sharedCode,
         FUniformExpressionSet expressionSet, bool usesGBuffer, PixelShaderWiring wiring, out string error)
     {
-        if (shader.ResourceIndex < 0 || shader.ResourceIndex >= code.ShaderEntries.Length)
+        byte[] blob;
+        if (code is { ShaderEntries.Length: > 0 })
         {
-            error = $"{typeName}: shader entry {shader.ResourceIndex} out of range";
-            return false;
-        }
-        var entry = code.ShaderEntries[shader.ResourceIndex];
-        if (entry.Code == null || entry.Code.Length == 0)
-        {
-            error = $"{typeName}: shader entry is empty";
-            return false;
-        }
+            if (shader.ResourceIndex < 0 || shader.ResourceIndex >= code.ShaderEntries.Length)
+            {
+                error = $"{typeName}: shader entry {shader.ResourceIndex} out of range";
+                return false;
+            }
+            var entry = code.ShaderEntries[shader.ResourceIndex];
+            if (entry.Code == null || entry.Code.Length == 0)
+            {
+                error = $"{typeName}: shader entry is empty";
+                return false;
+            }
 
-        // entries are LZ4 compressed unless they came out the same size (ShaderResource.cpp)
-        var blob = entry.Code.Length == entry.UncompressedSize
-            ? entry.Code
-            : Compression.Decompress(entry.Code, entry.UncompressedSize, CompressionMethod.LZ4);
+            // entries are LZ4 compressed unless they came out the same size (ShaderResource.cpp)
+            blob = entry.Code.Length == entry.UncompressedSize
+                ? entry.Code
+                : Compression.Decompress(entry.Code, entry.UncompressedSize, CompressionMethod.LZ4);
+        }
+        else
+        {
+            // the map shares its code: the bytecode comes from the pak-cooked shader library
+            var (shared, sharedError) = sharedCode(shader.ResourceIndex);
+            if (shared == null || shared.Length == 0)
+            {
+                error = $"{typeName}: {sharedError ?? "the shared shader library has no code for this shader"}";
+                return false;
+            }
+            blob = shared;
+        }
 
         // blob layout on PC D3D: [FD3D11ShaderResourceTable][DXBC container][optional data]
         // (D3D11ShaderResources.h: ResourceTableBits, then the five resource maps)
