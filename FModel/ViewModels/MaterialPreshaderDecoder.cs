@@ -73,7 +73,7 @@ public class PreshaderDecodeResult
 /// Decodes the compiled uniform expression ("preshader") bytecode kept in a cooked material's
 /// inline shader map back into symbolic expression trees. The virtual machine is a byte-packed
 /// stack machine whose opcode numbering changed across engine versions, so three opcode tables
-/// are kept (4.25-4.27, 5.0-5.2, 5.3-5.7) and the decoder falls back to the neighbouring UE5
+/// are kept (4.25-4.27, 5.0-5.3, 5.5-5.7) and the decoder falls back to the neighbouring UE5
 /// table when a window fails to validate against the version-preferred one.
 /// </summary>
 public static class MaterialPreshaderDecoder
@@ -122,7 +122,7 @@ public static class MaterialPreshaderDecoder
         EOp.Less, EOp.Assign, EOp.Greater, EOp.LessEqual, EOp.GreaterEqual
     ];
 
-    // UE::Shader::EPreshaderOpcode, UE 5.3-5.7: Modulo and SparseVolumeTextureUniform inserted,
+    // UE::Shader::EPreshaderOpcode, UE 5.5-5.7: Modulo and SparseVolumeTextureUniform inserted,
     // Exp/Exp2/Log appended (verified identical in 5.5 and 5.7 Preshader.h)
     private static readonly EOp[] TableUE53 =
     [
@@ -184,17 +184,19 @@ public static class MaterialPreshaderDecoder
             return result;
         }
 
-        var preferFive3 = game >= EGame.GAME_UE5_3;
-        var preferred = preferFive3 ? TableUE53 : TableUE50;
-        var preferredName = preferFive3 ? "UE 5.3-5.7" : "UE 5.0-5.2";
-        var alternate = preferFive3 ? TableUE50 : TableUE53;
-        var alternateName = preferFive3 ? "UE 5.0-5.2" : "UE 5.3-5.7";
+        // Preshader.h has the shifted numbering in 5.5 and 5.7 but not in 5.1, and a retail 5.3
+        // cook (Poppy Playtime Chapter 4) decodes cleanly against the OLD table — so 5.3 is old and
+        // the shift lands in 5.4 or 5.5. 5.4 is unverified either way and the retry below covers it.
+        var preferModulo = game >= EGame.GAME_UE5_5;
+        var preferred = preferModulo ? TableUE53 : TableUE50;
+        var preferredName = preferModulo ? "UE 5.5-5.7" : "UE 5.0-5.3";
+        var alternate = preferModulo ? TableUE50 : TableUE53;
+        var alternateName = preferModulo ? "UE 5.0-5.3" : "UE 5.5-5.7";
 
         RunTable(result, windows, context, preferred, preferredName);
         if (result.FailedCount == 0) return result;
 
-        // opcode numbering shifted somewhere between 5.2 and 5.5 with no local source to pin it
-        // down exactly, so when the version-preferred table fails, the neighbouring table is tried
+        // when the version-preferred table fails, the neighbouring one is tried
         var retry = new PreshaderDecodeResult();
         RunTable(retry, windows, context, alternate, alternateName);
         return retry.FailedCount < result.FailedCount ? retry : result;
@@ -205,7 +207,9 @@ public static class MaterialPreshaderDecoder
     {
         string[] slots = game switch
         {
-            >= EGame.GAME_UE5_3 => ["Texture 2D", "Texture Cube", "Texture 2D Array", "Texture Cube Array", "Volume Texture", "Virtual Texture", "Sparse Volume Texture", "Texture"],
+            // EMaterialTextureParameterType gained SparseVolume alongside the preshader change:
+            // absent in 5.1, present in 5.5/5.6 (MaterialShared.h)
+            >= EGame.GAME_UE5_5 => ["Texture 2D", "Texture Cube", "Texture 2D Array", "Texture Cube Array", "Volume Texture", "Virtual Texture", "Sparse Volume Texture", "Texture"],
             >= EGame.GAME_UE5_0 => ["Texture 2D", "Texture Cube", "Texture 2D Array", "Texture Cube Array", "Volume Texture", "Virtual Texture"],
             _ => ["Texture 2D", "Texture Cube", "Texture 2D Array", "Volume Texture", "Virtual Texture"]
         };

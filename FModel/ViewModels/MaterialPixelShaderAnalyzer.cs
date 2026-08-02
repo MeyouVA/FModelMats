@@ -68,10 +68,10 @@ public class PixelShaderWiring
     /// </summary>
     public string GBufferLayout { get; set; } = string.Empty;
     /// <summary>
-    /// How the World Position Offset pin was resolved, or why it could not be: WPO lives in the
-    /// vertex shader, so it is recovered from a separate stage than the rest of the pins.
+    /// For every pin recovered from a stage other than the base-pass pixel shader (World Position
+    /// Offset, World Displacement, Tessellation Multiplier), how it was resolved or why it was not.
     /// </summary>
-    public string WorldPositionOffsetNote { get; set; }
+    public Dictionary<string, string> StagePinNotes { get; } = new();
     /// <summary>Render target that held the GBuffer custom data for this shader, or -1.</summary>
     public int CustomDataTarget { get; set; } = -1;
     /// <summary>Render target that held GBufferF (tangent + anisotropy) for this shader, or -1.</summary>
@@ -206,8 +206,8 @@ public static class MaterialPixelShaderAnalyzer
                     wiring.ShaderTypeName = typeName;
                     try
                     {
-                        // WPO lives in the vertex shader, so it needs its own stage pass
-                        WireWorldPositionOffset(content, code, sharedCode, expressionSet, wiring);
+                        // WPO and the tessellation inputs live in other stages, so they need their own pass
+                        WireStageEvaluatedPins(content, code, sharedCode, expressionSet, wiring);
                     }
                     catch
                     {
@@ -228,64 +228,82 @@ public static class MaterialPixelShaderAnalyzer
     }
 
     /// <summary>
-    /// Adds the World Position Offset sources from the map's base-pass vertex shader — the stage
-    /// that evaluates WPO — to a successful pixel-shader result. Vertex shaders are tried
-    /// richest-first; a material without WPO simply leaves the pin unwired.
+    /// Adds the pins no pixel shader evaluates — World Position Offset (vertex shader), and with
+    /// tessellation enabled World Displacement (domain shader) and Tessellation Multiplier (hull
+    /// shader) — to a successful pixel-shader result. Each stage is tried richest-first; a material
+    /// that does not drive one of them simply leaves that pin unwired, with the reason recorded.
     /// </summary>
-    private static void WireWorldPositionOffset(FMaterialShaderMapContent content, FShaderMapResourceCode code,
+    private static void WireStageEvaluatedPins(FMaterialShaderMapContent content, FShaderMapResourceCode code,
         Func<int, (byte[] Blob, string Error)> sharedCode, FUniformExpressionSet expressionSet, PixelShaderWiring wiring)
     {
-        var vertexShaders = new List<FShader>();
+        var byFrequency = new Dictionary<EShaderFrequency, List<FShader>>();
         void Collect(FShader[] shaders)
         {
             foreach (var shader in shaders ?? [])
-                if (shader?.Target.Frequency == EShaderFrequency.SF_Vertex)
-                    vertexShaders.Add(shader);
+            {
+                if (shader == null) continue;
+                if (!byFrequency.TryGetValue(shader.Target.Frequency, out var list))
+                    byFrequency[shader.Target.Frequency] = list = [];
+                list.Add(shader);
+            }
         }
         Collect(content.Shaders);
         foreach (var mesh in content.OrderedMeshShaderMaps ?? [])
             Collect(mesh.Shaders);
 
-        foreach (var shader in vertexShaders.OrderByDescending(s => s.NumInstructions).Take(6))
+        byte[] BlobOf(FShader shader)
         {
-            if (!TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
-            {
-                wiring.WorldPositionOffsetNote ??= slotReason;
-                continue;
-            }
-
-            byte[] blob;
             try
             {
                 if (code is { ShaderEntries.Length: > 0 })
                 {
-                    if (shader.ResourceIndex < 0 || shader.ResourceIndex >= code.ShaderEntries.Length) continue;
+                    if (shader.ResourceIndex < 0 || shader.ResourceIndex >= code.ShaderEntries.Length) return null;
                     var entry = code.ShaderEntries[shader.ResourceIndex];
-                    if (entry.Code is not { Length: > 0 }) continue;
-                    blob = entry.Code.Length == entry.UncompressedSize
+                    if (entry.Code is not { Length: > 0 }) return null;
+                    return entry.Code.Length == entry.UncompressedSize
                         ? entry.Code
                         : Compression.Decompress(entry.Code, entry.UncompressedSize, CompressionMethod.LZ4);
                 }
-                else
-                {
-                    if (sharedCode == null) return;
-                    blob = sharedCode(shader.ResourceIndex).Blob;
-                    if (blob is not { Length: > 0 }) continue;
-                }
+                return sharedCode?.Invoke(shader.ResourceIndex).Blob;
             }
-            catch { continue; }
-
-            var sources = AnalyzeWorldPositionOffset(blob, expressionSet, materialSlot, out var error, out var expression);
-            if (sources == null)
-            {
-                wiring.WorldPositionOffsetNote ??= error;
-                continue;
-            }
-            wiring.PinSources["World Position Offset"] = sources;
-            if (expression != null) wiring.PinExpressions["World Position Offset"] = expression;
-            wiring.WorldPositionOffsetNote = "recovered from the base-pass vertex shader's position output";
-            return;
+            catch { return null; }
         }
+
+        void WireStage(EShaderFrequency frequency, string pin, string semanticPrefix, string outputLabel, string stageName)
+        {
+            if (!byFrequency.TryGetValue(frequency, out var shaders)) return;
+            foreach (var shader in shaders.OrderByDescending(s => s.NumInstructions).Take(6))
+            {
+                if (!TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
+                {
+                    wiring.StagePinNotes.TryAdd(pin, slotReason);
+                    continue;
+                }
+                var blob = BlobOf(shader);
+                if (blob == null) continue;
+
+                var sources = AnalyzeStageOutput(blob, expressionSet, materialSlot, semanticPrefix, outputLabel,
+                    out var error, out var expression);
+                if (sources == null)
+                {
+                    wiring.StagePinNotes.TryAdd(pin, error);
+                    continue;
+                }
+                wiring.PinSources[pin] = sources;
+                if (expression != null) wiring.PinExpressions[pin] = expression;
+                wiring.StagePinNotes[pin] = $"recovered from the {stageName}'s {outputLabel} output";
+                return;
+            }
+        }
+
+        WireStage(EShaderFrequency.SF_Vertex, "World Position Offset", "SV_Position", "position", "base-pass vertex shader");
+        // UE4's EShaderFrequency is SF_Vertex/Hull/Domain/Pixel/Geometry/Compute; UE5 reused slots
+        // 1 and 2 for Mesh/Amplification when it removed tessellation, and CUE4Parse's enum carries
+        // the UE5 names — this path only runs for UE4 shader maps, where 1 = Hull and 2 = Domain
+        const EShaderFrequency hullFrequency = (EShaderFrequency) 1;
+        const EShaderFrequency domainFrequency = (EShaderFrequency) 2;
+        WireStage(domainFrequency, "World Displacement", "SV_Position", "position", "domain shader");
+        WireStage(hullFrequency, "Tessellation Multiplier", "SV_TessFactor", "tessellation factor", "hull shader");
     }
 
     #endregion
@@ -397,6 +415,23 @@ public static class MaterialPixelShaderAnalyzer
     /// </summary>
     public static List<PixelValueSource> AnalyzeWorldPositionOffset(byte[] blob, FUniformExpressionSet expressionSet,
         int materialSlot, out string error, out PixelExpressionNode expression)
+        => AnalyzeStageOutput(blob, expressionSet, materialSlot, "SV_Position", "position", out error, out expression);
+
+    /// <summary>
+    /// The material values a compiled stage routes into one of its outputs, chosen by semantic
+    /// prefix. Used for the material inputs no pixel shader evaluates:
+    /// <list type="bullet">
+    /// <item>vertex shader + SV_Position → World Position Offset</item>
+    /// <item>domain shader + SV_Position → World Displacement (DomainShader.usf adds
+    /// GetMaterialWorldDisplacement to the tessellated point before transforming it)</item>
+    /// <item>hull shader + SV_TessFactor → Tessellation Multiplier (the patch-constant phase scales
+    /// the edge factors by GetMaterialTessellationMultiplier)</item>
+    /// </list>
+    /// In each case the material has exactly one input into that output, so a material value
+    /// reaching it can only have come through that input.
+    /// </summary>
+    public static List<PixelValueSource> AnalyzeStageOutput(byte[] blob, FUniformExpressionSet expressionSet,
+        int materialSlot, string semanticPrefix, string outputLabel, out string error, out PixelExpressionNode expression)
     {
         error = null;
         expression = null;
@@ -418,11 +453,22 @@ public static class MaterialPixelShaderAnalyzer
             }
             if (program == null || program.Length < 2) { error = "the vertex shader has no program chunk"; return null; }
 
-            var positionRegister = outputSemantics
-                .Where(kv => kv.Value.StartsWith("SV_Position", StringComparison.OrdinalIgnoreCase))
-                .Select(kv => (long?) kv.Key)
-                .FirstOrDefault();
-            if (positionRegister is not { } positionReg) { error = "the vertex shader declares no position output"; return null; }
+            var matchedRegisters = outputSemantics
+                .Where(kv => kv.Value.StartsWith(semanticPrefix, StringComparison.OrdinalIgnoreCase))
+                .Select(kv => kv.Key)
+                .ToList();
+            if (matchedRegisters.Count == 0)
+            {
+                // a hull shader writes its tessellation factors in the patch-constant phase, whose
+                // signature is a separate chunk over the same o# register file
+                if (TryGetSignatureElements(blob, out var patchElements, out _, ["PCSG"]))
+                    matchedRegisters = patchElements
+                        .Where(e => e.Name.StartsWith(semanticPrefix, StringComparison.OrdinalIgnoreCase))
+                        .Select(e => (long) e.Register)
+                        .Distinct()
+                        .ToList();
+            }
+            if (matchedRegisters.Count == 0) { error = $"the shader declares no {outputLabel} output"; return null; }
 
             var instructions = DecodeProgram(program, out _, out var resourceDimensions);
 
@@ -443,16 +489,15 @@ public static class MaterialPixelShaderAnalyzer
             };
             var (state, _) = RunTaintAnalysis(instructions, context);
 
-            if (!state.Registers.TryGetValue(('o', positionReg), out var components))
-            {
-                error = "the vertex shader's position output reads no material value";
-                return null;
-            }
             var sources = new List<PixelValueSource>();
-            foreach (var component in components)
-                foreach (var source in component)
-                    if (!sources.Contains(source)) sources.Add(source);
-            if (sources.Count == 0) { error = "the vertex shader's position output reads no material value"; return null; }
+            foreach (var register in matchedRegisters)
+            {
+                if (!state.Registers.TryGetValue(('o', register), out var components)) continue;
+                foreach (var component in components)
+                    foreach (var source in component)
+                        if (!sources.Contains(source)) sources.Add(source);
+            }
+            if (sources.Count == 0) { error = $"the shader's {outputLabel} output reads no material value"; return null; }
 
             // recover the position output's expression DAG so Expand Shader Math opens this pin too
             try
@@ -462,10 +507,10 @@ public static class MaterialPixelShaderAnalyzer
                     new Dictionary<int, string>(), inputSemantics, resourceDimensions, new PixelShaderWiring(),
                     resultOverride: stageResults, outputSemantics: outputSemantics);
                 foreach (var (label, node) in stageResults)
-                    if (label.StartsWith("SV_Position", StringComparison.OrdinalIgnoreCase))
+                    if (label.StartsWith(semanticPrefix, StringComparison.OrdinalIgnoreCase))
                     {
                         expression = PruneToMaterialSubtree(node);
-                        break;
+                        if (expression != null) break;
                     }
             }
             catch
@@ -507,10 +552,10 @@ public static class MaterialPixelShaderAnalyzer
             case 0:
                 // every buffer this stage binds is an auto-bound engine one (View, the vertex
                 // factory, …): the material contributes no constant to it
-                reason = "the vertex shader binds no material constants, so nothing material-driven reaches the vertex position";
+                reason = "the shader binds no material constants, so nothing material-driven reaches this output";
                 return false;
             default:
-                reason = "the vertex shader binds several non-engine uniform buffers, so the Material one cannot be told apart";
+                reason = "the shader binds several non-engine uniform buffers, so the Material one cannot be told apart";
                 return false;
         }
     }
@@ -632,7 +677,8 @@ public static class MaterialPixelShaderAnalyzer
     /// element order is the signature element id DXIL's storeOutput indexes.
     /// </summary>
     private static bool TryGetSignatureElements(byte[] blob,
-        out List<(string Name, int SemanticIndex, int SystemValue, int Register, int Mask)> elements, out string error)
+        out List<(string Name, int SemanticIndex, int SystemValue, int Register, int Mask)> elements, out string error,
+        string[] chunkNames = null)
     {
         elements = [];
         error = null;
@@ -648,8 +694,9 @@ public static class MaterialPixelShaderAnalyzer
         {
             var chunkOffset = containerStart + (int) BitConverter.ToUInt32(blob, containerStart + 32 + i * 4);
             var fourcc = FourCC(chunkOffset);
-            // OSGN: 24-byte elements; OSG1/OSG5: 32-byte elements led by a stream index
-            var stride = fourcc switch { "OSGN" => 24, "OSG1" or "OSG5" => 32, _ => 0 };
+            if (chunkNames != null && Array.IndexOf(chunkNames, fourcc) < 0) continue;
+            // OSGN/PCSG: 24-byte elements; OSG1/OSG5: 32-byte elements led by a stream index
+            var stride = fourcc switch { "OSGN" or "PCSG" => 24, "OSG1" or "OSG5" => 32, _ => 0 };
             if (stride == 0) continue;
 
             var dataStart = chunkOffset + 8;
@@ -2012,6 +2059,12 @@ public static class MaterialPixelShaderAnalyzer
                     break;
                 case "ISGN":
                     ParseInputSignature(blob, dataStart, inputSemantics);
+                    break;
+                case "PCSG":
+                    // patch-constant signature: a hull shader's tessellation factors live here,
+                    // not in OSGN, and they share the o# register file of its patch-constant phase
+                    ParseOutputSemantics(blob, dataStart, outputSemantics);
+                    foundOutputs = true;
                     break;
                 case "SHEX" or "SHDR":
                     var dwordCount = chunkSize / 4;

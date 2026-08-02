@@ -1022,51 +1022,63 @@ public class MaterialGraphViewModel
 
         // World Position Offset is computed in the vertex shader, not the pixel shader
         if (best is { Success: true })
-            WireWorldPositionOffsetDxil(content, expressionSet, provider, resourceHash, best);
+            WireStageEvaluatedPinsDxil(content, expressionSet, provider, resourceHash, best);
         return best ?? new PixelShaderWiring { FailureReason = lastError };
     }
 
     /// <summary>
-    /// Adds the World Position Offset pin's sources from the base-pass VERTEX shader, the stage
-    /// that actually evaluates WPO. Vertex shaders are tried richest-first and the first one whose
-    /// position output provably carries material values wins; a material without WPO simply leaves
-    /// the pin unwired, as before.
+    /// Adds the pins evaluated outside the base-pass pixel shader: World Position Offset from the
+    /// vertex shader, and — where the cook still has tessellation stages — World Displacement from
+    /// the domain shader. Shaders are tried richest-first and the first whose output provably
+    /// carries material values wins; a material that drives neither leaves those pins unwired.
     /// </summary>
-    private static void WireWorldPositionOffsetDxil(FMaterialShaderMapContent content, FUniformExpressionSet expressionSet,
+    private static void WireStageEvaluatedPinsDxil(FMaterialShaderMapContent content, FUniformExpressionSet expressionSet,
         IVfsFileProvider provider, FSHAHash resourceHash, PixelShaderWiring wiring)
     {
-        var vertexShaders = new List<FShader>();
+        var byFrequency = new Dictionary<EShaderFrequency, List<FShader>>();
         void Collect(FShader[] shaders)
         {
             foreach (var shader in shaders ?? [])
-                if (shader?.Target.Frequency == EShaderFrequency.SF_Vertex)
-                    vertexShaders.Add(shader);
+            {
+                if (shader == null) continue;
+                if (!byFrequency.TryGetValue(shader.Target.Frequency, out var list))
+                    byFrequency[shader.Target.Frequency] = list = [];
+                list.Add(shader);
+            }
         }
         Collect(content.Shaders);
         foreach (var mesh in content.OrderedMeshShaderMaps ?? [])
             Collect(mesh.Shaders);
 
-        foreach (var shader in vertexShaders.OrderByDescending(s => s.NumInstructions).Take(6))
+        void WireStage(EShaderFrequency frequency, string pin, string stageName)
         {
-            if (!MaterialPixelShaderAnalyzer.TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
+            if (!byFrequency.TryGetValue(frequency, out var shaders)) return;
+            foreach (var shader in shaders.OrderByDescending(s => s.NumInstructions).Take(6))
             {
-                wiring.WorldPositionOffsetNote ??= slotReason;
-                continue;
+                if (!MaterialPixelShaderAnalyzer.TryGetMaterialUniformBufferSlot(shader, out var materialSlot, out var slotReason))
+                {
+                    wiring.StagePinNotes.TryAdd(pin, slotReason);
+                    continue;
+                }
+                var blob = MaterialDxilLibrary.TryGetShaderCode(provider, resourceHash, shader.ResourceIndex, out _);
+                if (blob == null) continue;
+                var sources = MaterialPixelShaderAnalyzer.AnalyzeDxilWorldPositionOffset(blob, expressionSet, materialSlot,
+                    out var error, out var expression);
+                if (sources == null)
+                {
+                    wiring.StagePinNotes.TryAdd(pin, error);
+                    continue;
+                }
+                wiring.PinSources[pin] = sources;
+                if (expression != null) wiring.PinExpressions[pin] = expression;
+                wiring.StagePinNotes[pin] = $"recovered from the {stageName}'s position output";
+                return;
             }
-            var blob = MaterialDxilLibrary.TryGetShaderCode(provider, resourceHash, shader.ResourceIndex, out _);
-            if (blob == null) continue;
-            var sources = MaterialPixelShaderAnalyzer.AnalyzeDxilWorldPositionOffset(blob, expressionSet, materialSlot,
-                out var error, out var expression);
-            if (sources == null)
-            {
-                wiring.WorldPositionOffsetNote ??= error;
-                continue;
-            }
-            wiring.PinSources["World Position Offset"] = sources;
-            if (expression != null) wiring.PinExpressions["World Position Offset"] = expression;
-            wiring.WorldPositionOffsetNote = "recovered from the base-pass vertex shader's position output";
-            return;
         }
+
+        // UE5 removed tessellation altogether (and reused the hull/domain frequency slots for
+        // mesh/amplification shaders), so the vertex stage is the only extra one here
+        WireStage(EShaderFrequency.SF_Vertex, "World Position Offset", "base-pass vertex shader");
     }
 
     /// <summary>
@@ -1084,9 +1096,10 @@ public class MaterialGraphViewModel
         // how the optional GBuffer targets were named — the reading behind the custom-data pins
         if (!string.IsNullOrEmpty(wiring.GBufferLayout))
             outputNode.DisplayProperties.Add(new KeyValuePair<string, string>("GBuffer Layout", wiring.GBufferLayout));
-        // WPO comes from the vertex stage, so its outcome is reported separately
-        if (!string.IsNullOrEmpty(wiring.WorldPositionOffsetNote))
-            outputNode.DisplayProperties.Add(new KeyValuePair<string, string>("World Position Offset", wiring.WorldPositionOffsetNote));
+        // pins recovered from other stages report their own outcome
+        foreach (var (pin, note) in wiring.StagePinNotes)
+            if (!string.IsNullOrEmpty(note))
+                outputNode.DisplayProperties.Add(new KeyValuePair<string, string>(pin, note));
         _otherStageWiredValues = 0;
         _otherStageNodeCount = 0;
         _otherStageExpandedCount = 0;
