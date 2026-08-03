@@ -190,6 +190,24 @@ public static class MaterialUnrealExporter
         ["Tessellation Multiplier"] = "MP_TESSELLATION_MULTIPLIER",
     };
 
+    /// <summary>
+    /// The viewer builds a loose parameter node's type from its display title, so those names are
+    /// labels, not Unreal classes. These are the real classes each one means
+    /// (Engine/Classes/Materials/MaterialExpression*.h) — note the parameter forms, since e.g.
+    /// UMaterialExpressionStaticSwitch is the A/B switch node, not a named switch parameter.
+    /// </summary>
+    private static readonly Dictionary<string, string> LooseParameterClasses = new(StringComparer.Ordinal)
+    {
+        ["MaterialExpressionStaticSwitch"] = "MaterialExpressionStaticSwitchParameter",
+        ["MaterialExpressionStaticComponentMask"] = "MaterialExpressionStaticComponentMaskParameter",
+        ["MaterialExpressionTextureParameter"] = "MaterialExpressionTextureSampleParameter2D",
+        ["MaterialExpressionFontParameter"] = "MaterialExpressionFontSampleParameter",
+        ["MaterialExpressionRuntimeVirtualTextureParameter"] = "MaterialExpressionRuntimeVirtualTextureSampleParameter",
+        ["MaterialExpressionDoubleVectorParameter"] = "MaterialExpressionVectorParameter",
+        // the viewer's fallback title when the decoder could not name the parameter's type
+        ["MaterialExpressionParameter"] = "MaterialExpressionScalarParameter",
+    };
+
     // ---------------------------------------------------------------- entry point
 
     /// <summary>
@@ -576,6 +594,13 @@ public static class MaterialUnrealExporter
     /// something a material graph can hold.</summary>
     private static NodePlan PlanFor(MaterialGraphNode node, MaterialPortResult result)
     {
+        // Loose parameter nodes name their class from the viewer's own title, which is a label
+        // rather than an Unreal class name — "Static Switch" is UMaterialExpressionStaticSwitch,
+        // a node with A/B inputs, not the named parameter the material actually has. Correct those
+        // to the real parameter classes before anything else claims them.
+        if (LooseParameterClasses.TryGetValue(node.ExportType, out var corrected))
+            return new NodePlan(corrected, []);
+
         // an authored graph already names real Unreal classes — port them unchanged
         if (node.ExportType.StartsWith("MaterialExpression", StringComparison.Ordinal))
             return new NodePlan(node.ExportType, []);
@@ -697,6 +722,17 @@ public static class MaterialUnrealExporter
         return new NodePlan(isVector ? "MaterialExpressionVectorParameter" : "MaterialExpressionScalarParameter", []);
     }
 
+    /// <summary>A parameter node names itself either through a "Parameter Name" property or before
+    /// the "=" in its subtitle, depending on which builder produced it.</summary>
+    private static string ParameterNameOf(MaterialGraphNode node)
+    {
+        var name = DisplayValue(node, "Parameter Name");
+        if (!string.IsNullOrEmpty(name)) return name;
+        var subtitle = node.Subtitle ?? string.Empty;
+        var equals = subtitle.IndexOf('=');
+        return (equals >= 0 ? subtitle[..equals] : subtitle).Trim();
+    }
+
     /// <summary>A parameter node states its default either as a "Value" property or after the "=" in
     /// its subtitle, depending on which builder produced it.</summary>
     private static string ValueOf(MaterialGraphNode node)
@@ -794,18 +830,37 @@ public static class MaterialUnrealExporter
                 break;
             }
 
+            case "MaterialExpressionStaticSwitchParameter":
+            case "MaterialExpressionStaticComponentMaskParameter":
+            {
+                var switchName = ParameterNameOf(node);
+                if (!string.IsNullOrEmpty(switchName))
+                    yield return $"_set({target}, \"parameter_name\", {Quote(switchName)})";
+
+                var switchValue = ValueOf(node);
+                if (plan.UnrealClass.EndsWith("StaticSwitchParameter", StringComparison.Ordinal))
+                {
+                    // UMaterialExpressionStaticBoolParameter::DefaultValue is the switch's value
+                    yield return $"_set({target}, \"default_value\", " +
+                                 $"{(switchValue.Equals("True", StringComparison.OrdinalIgnoreCase) ? "True" : "False")})";
+                }
+                else
+                {
+                    // the mask node keeps one flag per channel; the graph records the live ones
+                    var channels = (switchValue ?? string.Empty).ToUpperInvariant();
+                    foreach (var (channel, property) in new[] { ('R', "default_r"), ('G', "default_g"), ('B', "default_b"), ('A', "default_a") })
+                        yield return $"_set({target}, {Quote(property)}, {(channels.Contains(channel) ? "True" : "False")})";
+                }
+                break;
+            }
+
             case "MaterialExpressionScalarParameter":
             case "MaterialExpressionVectorParameter":
             case "MaterialExpressionTextureSampleParameter2D":
+            case "MaterialExpressionFontSampleParameter":
+            case "MaterialExpressionRuntimeVirtualTextureSampleParameter":
             {
-                var name = DisplayValue(node, "Parameter Name");
-                if (string.IsNullOrEmpty(name))
-                {
-                    // a preshader parameter node writes "Name = value" as its subtitle
-                    var subtitle = node.Subtitle ?? string.Empty;
-                    var equals = subtitle.IndexOf('=');
-                    name = (equals >= 0 ? subtitle[..equals] : subtitle).Trim();
-                }
+                var name = ParameterNameOf(node);
                 if (!string.IsNullOrEmpty(name))
                     yield return $"_set({target}, \"parameter_name\", {Quote(name)})";
 

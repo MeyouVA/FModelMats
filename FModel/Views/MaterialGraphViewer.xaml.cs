@@ -476,6 +476,62 @@ public partial class MaterialGraphViewer
     private void OnUnhideAllClicked(object sender, RoutedEventArgs e) => UnhideAll();
 
     /// <summary>
+    /// Shows the material as shader-style code over the graph. The listing is built from the same
+    /// recovered expression DAG the graph draws, so the two can never disagree.
+    /// </summary>
+    private void OnShowCodeToggled(object sender, RoutedEventArgs e)
+    {
+        if (ShowCodeButton.IsChecked != true)
+        {
+            CodePanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        if (CodeText.Text.Length == 0)
+        {
+            string code;
+            try { code = _viewModel.BuildCodeView(); }
+            catch (Exception exception) { code = $"// The code view could not be built: {exception.Message}"; }
+
+            CodeText.Text = code;
+            CodeCreditText.Text = MaterialCodeView.Credit;
+            var lines = code.Count(c => c == '\n') + 1;
+            CodeStatsText.Text = _viewModel.CanShowCode
+                ? $"{lines:N0} lines"
+                : $"{lines:N0} lines — nothing was recovered from this material's compiled shader data";
+        }
+
+        CodePanel.Visibility = Visibility.Visible;
+    }
+
+    private void OnCodeWrapToggled(object sender, RoutedEventArgs e) =>
+        CodeText.TextWrapping = CodeWrapCheck.IsChecked == true ? TextWrapping.Wrap : TextWrapping.NoWrap;
+
+    private void OnCopyCode(object sender, RoutedEventArgs e)
+    {
+        if (CodeText.Text.Length > 0) Clipboard.SetText(CodeText.Text);
+    }
+
+    private void OnSaveCode(object sender, RoutedEventArgs e)
+    {
+        if (CodeText.Text.Length == 0) return;
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Save the shader code listing",
+            FileName = $"{_viewModel.MaterialName}.txt",
+            Filter = "Text file (*.txt)|*.txt|All files (*.*)|*.*",
+            DefaultExt = ".txt"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try { System.IO.File.WriteAllText(dialog.FileName, CodeText.Text); }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"The listing could not be written: {exception.Message}",
+                "Code View", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
     /// Writes the Unreal editor script that rebuilds this material. The port's fidelity is shown
     /// before the file is written, so it is clear what came across exactly and what did not.
     /// </summary>

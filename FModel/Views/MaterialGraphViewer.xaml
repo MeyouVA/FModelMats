@@ -62,6 +62,9 @@
 
                 <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
 
+                <ToggleButton x:Name="ShowCodeButton" Content="Code View" MinWidth="86" Margin="4 0"
+                              Checked="OnShowCodeToggled" Unchecked="OnShowCodeToggled"
+                              ToolTip="Show the same recovered data as shader-style code: the compiled pixel shader's expressions per material output, with shared values hoisted, plus the decoded uniform expressions."/>
                 <Button x:Name="PortToUnrealButton" Content="Port to Unreal" MinWidth="105" Margin="4 0" Click="OnPortToUnreal"
                         ToolTip="Write an Unreal editor Python script that rebuilds this material in a project. Operations with no equivalent Unreal node become Custom HLSL nodes rather than being approximated; the differences are listed before saving."/>
             </WrapPanel>
@@ -84,7 +87,40 @@
             </Grid.ColumnDefinitions>
 
             <!-- Graph canvas -->
-            <Border x:Name="CanvasHost" Grid.Column="0" ClipToBounds="True" Background="#FF181818"/>
+            <Grid Grid.Column="0">
+                <Border x:Name="CanvasHost" ClipToBounds="True" Background="#FF181818"/>
+
+                <!-- Code view: the same recovered data as text, over the graph rather than in a tab -->
+                <Border x:Name="CodePanel" Visibility="Collapsed" Background="#FF1E1E1E">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" Padding="8 5"
+                                Background="{DynamicResource {x:Static adonisUi:Brushes.Layer2BackgroundBrush}}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Shader Code" FontWeight="SemiBold" FontSize="13" VerticalAlignment="Center"/>
+                                <TextBlock x:Name="CodeStatsText" VerticalAlignment="Center" Margin="12 0 0 0" Opacity="0.7"/>
+                                <Button Content="Copy" MinWidth="52" Padding="6 1" Margin="12 0 0 0" Click="OnCopyCode"
+                                        ToolTip="Copy the whole listing to the clipboard"/>
+                                <Button Content="Save…" MinWidth="58" Padding="6 1" Margin="6 0 0 0" Click="OnSaveCode"
+                                        ToolTip="Write the listing to a text file"/>
+                                <TextBlock Text="Word wrap" VerticalAlignment="Center" Margin="16 0 4 0" Opacity="0.7"/>
+                                <CheckBox x:Name="CodeWrapCheck" VerticalAlignment="Center" Click="OnCodeWrapToggled"/>
+                                <TextBlock x:Name="CodeCreditText" VerticalAlignment="Center" Margin="18 0 0 0" Opacity="0.7"/>
+                            </StackPanel>
+                        </Border>
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                            <TextBox x:Name="CodeText" IsReadOnly="True" BorderThickness="0"
+                                     Background="Transparent" Foreground="#FFD8D8D8"
+                                     FontFamily="Cascadia Mono, Consolas, Courier New" FontSize="12"
+                                     TextWrapping="NoWrap" AcceptsReturn="True" VerticalScrollBarVisibility="Disabled"
+                                     HorizontalScrollBarVisibility="Disabled" Padding="10 8"/>
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+            </Grid>
 
             <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"
                           Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>

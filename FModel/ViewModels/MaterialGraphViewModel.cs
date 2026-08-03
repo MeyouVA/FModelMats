@@ -152,6 +152,17 @@ public class MaterialGraphViewModel
     /// toggle and call <see cref="Rebuild"/>.
     /// </summary>
     public bool UserGraphOnly { get; set; }
+
+    /// <summary>Set when the reconstruction recovered enough to print the material as shader code.</summary>
+    public bool CanShowCode => _codeSource is { } source &&
+                               (source.Wiring?.PinExpressions.Count > 0 || source.Preshaders is { AnyDecoded: true });
+
+    private MaterialCodeViewSource _codeSource;
+
+    /// <summary>Renders the same recovered data the graph draws as shader-style code.</summary>
+    public string BuildCodeView() => _codeSource == null
+        ? "// Nothing was recovered from this material's compiled shader data."
+        : MaterialCodeView.Build(_codeSource);
     /// <summary>
     /// True when the graph contains a mix of user-authored and engine-generated nodes, so the
     /// user-graph highlight/isolation options have something to act on.
@@ -238,6 +249,14 @@ public class MaterialGraphViewModel
 
     private void Extract(UMaterialInterface material)
     {
+        var chain = ExtractGraph(material);
+        // every tier above shows the parameters its own source referenced; this last pass adds the
+        // ones none of them reached, so the graph lists every parameter the asset actually carries
+        try { AddUnreferencedParameters(chain); } catch { /* additive only, never breaks the graph */ }
+    }
+
+    private List<UMaterialInterface> ExtractGraph(UMaterialInterface material)
+    {
         // walk the instance chain down to the root material so expression graphs
         // authored on the master material can be shown for instances too
         var chain = new List<UMaterialInterface> { material };
@@ -283,7 +302,7 @@ public class MaterialGraphViewModel
                     ApplyInstanceOverrides(chain);
                     TryAttachLegacyShaderCode(chain);
                 }
-                return;
+                return chain;
             }
 
             ApplyInstanceOverrides(chain);
@@ -299,6 +318,8 @@ public class MaterialGraphViewModel
             if (!TryBuildShaderMapGraph(chain))
                 BuildReconstructedGraph(chain);
         }
+
+        return chain;
     }
 
     #region True expression graph
@@ -616,6 +637,121 @@ public class MaterialGraphViewModel
         }
     }
 
+    /// <summary>
+    /// Adds a node for every parameter the asset carries that no graph tier already showed.
+    ///
+    /// A graph is built from one shader map — the first resource that has one — and from whichever
+    /// parameters its bytecode actually referenced. That legitimately misses three groups, all of
+    /// which are real serialized data:
+    /// <list type="bullet">
+    /// <item>parameters that only appear in the material's OTHER resources (a material cooks one
+    /// resource per quality/feature level, and they do not all reference the same parameters);</item>
+    /// <item>values an instance overrides whose parameter never showed up in the parent's shader map,
+    /// which previously had nothing to attach to and were dropped;</item>
+    /// <item><b>static switch and static component mask parameters</b>, which are compile-time: they
+    /// pick which permutation was cooked, so they are never in the uniform expression set at all and
+    /// only ever exist in an instance's static parameter set.</item>
+    /// </list>
+    /// Everything added here is read straight from the asset; nothing is inferred.
+    /// </summary>
+    private void AddUnreferencedParameters(List<UMaterialInterface> chain)
+    {
+        if (chain == null || chain.Count == 0) return;
+
+        var shown = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var node in Nodes.Where(n => n.IsParameter))
+        {
+            var name = node.DisplayProperties.FirstOrDefault(p => p.Key == "Parameter Name").Value;
+            if (string.IsNullOrEmpty(name)) name = node.Subtitle.Split(" = ")[0].Trim();
+            if (!string.IsNullOrEmpty(name)) shown.Add(name);
+        }
+
+        var row = 0;
+        var added = 0;
+
+        void Add(string title, string name, string value, string pinType, string source)
+        {
+            if (string.IsNullOrEmpty(name) || name == "None" || !shown.Add(name)) return;
+            var node = AddLooseParameterNode(title, name, value, pinType, ref row);
+            node.DisplayProperties.Add(new KeyValuePair<string, string>("Read From", source));
+            added++;
+        }
+
+        // ---- every resource's shader map, not just the one the graph was built from ----
+        foreach (var material in chain)
+        {
+            foreach (var resource in material.LoadedMaterialResources ?? [])
+            {
+                if (resource.LoadedShaderMap?.Content is not FMaterialShaderMapContent content ||
+                    content.MaterialCompilationOutput?.UniformExpressionSet is not { } set) continue;
+
+                var origin = $"{material.Name} shader map";
+                foreach (var parameter in set.UniformNumericParameters ?? [])
+                    Add(GetNumericParameterTitle(parameter.ParameterType), parameter.ParameterInfo?.Name.Text,
+                        FormatNumericParameterValue(parameter.Value), GetNumericParameterPinType(parameter.ParameterType), origin);
+
+                foreach (var parameter in set.UniformScalarParameters ?? [])
+                    Add("Scalar Parameter", parameter.ParameterInfo?.Name.Text ?? parameter.ParameterName,
+                        parameter.DefaultValue.ToString("0.####"), "float", origin);
+
+                foreach (var parameter in set.UniformVectorParameters ?? [])
+                    Add("Vector Parameter", parameter.ParameterInfo?.Name.Text ?? parameter.ParameterName,
+                        FormatColor(parameter.DefaultValue), "color", origin);
+
+                foreach (var slot in set.UniformTextureParameters ?? [])
+                    foreach (var parameter in slot ?? [])
+                        Add("Texture Parameter", parameter.ParameterInfo?.Name.Text, string.Empty, "texture", origin);
+            }
+        }
+
+        // ---- values the instances override, including the compile-time static ones ----
+        foreach (var material in chain)
+        {
+            if (material is not UMaterialInstance instance) continue;
+            var origin = $"{instance.Name} override";
+
+            AddOverrides(instance, "ScalarParameterValues", "Scalar Parameter", "float", origin,
+                v => v.TryGetValue(out float scalar, "ParameterValue") ? scalar.ToString("0.####") : null);
+            AddOverrides(instance, "VectorParameterValues", "Vector Parameter", "color", origin,
+                v => v.TryGetValue(out FLinearColor color, "ParameterValue") ? FormatColor(color) : null);
+            AddOverrides(instance, "TextureParameterValues", "Texture Parameter", "texture", origin,
+                v => v.TryGetValue(out FPackageIndex texture, "ParameterValue") ? texture.Name : null);
+            AddOverrides(instance, "FontParameterValues", "Font Parameter", "default", origin,
+                v => v.TryGetValue(out FPackageIndex font, "FontValue") ? font.Name : null);
+            AddOverrides(instance, "RuntimeVirtualTextureParameterValues", "Runtime Virtual Texture Parameter", "texture", origin,
+                v => v.TryGetValue(out FPackageIndex vt, "ParameterValue") ? vt.Name : null);
+
+            if (instance.StaticParameters is not { } statics) continue;
+
+            foreach (var parameter in statics.StaticSwitchParameters ?? [])
+                Add("Static Switch", parameter.Name, parameter.Value.ToString(), "bool", origin);
+
+            foreach (var parameter in statics.StaticComponentMaskParameters ?? [])
+            {
+                var channels = string.Concat(
+                    parameter.R ? "R" : "", parameter.G ? "G" : "",
+                    parameter.B ? "B" : "", parameter.A ? "A" : "");
+                Add("Static Component Mask", parameter.Name, channels.Length > 0 ? channels : "(none)", "default", origin);
+            }
+        }
+
+        if (added > 0)
+            ReconstructionNote = (ReconstructionNote + " " +
+                $"{added} further parameter(s) that no shader the graph was built from referenced are shown as loose nodes, " +
+                "read from the material's other compiled resources and its instances' overrides.").Trim();
+
+        void AddOverrides(UMaterialInstance instance, string propertyName, string title, string pinType,
+            string origin, Func<FStructFallback, string> formatValue)
+        {
+            if (!instance.TryGetValue(out FStructFallback[] values, propertyName)) return;
+            foreach (var value in values)
+            {
+                if (!value.TryGetValue(out FStructFallback parameterInfo, "ParameterInfo")) continue;
+                Add(title, parameterInfo.GetOrDefault<FName>("Name").Text, formatValue(value) ?? string.Empty, pinType, origin);
+            }
+        }
+    }
+
     private void OverrideParameterNode(string parameterName, string value, string instanceName)
     {
         foreach (var node in Nodes)
@@ -681,6 +817,60 @@ public class MaterialGraphViewModel
             ReconstructionNote = string.Empty;
             return false;
         }
+    }
+
+    /// <summary>
+    /// Keeps the recovered pixel-shader expression DAG and decoded uniform expressions so the code
+    /// view can print them, together with the binding-table names that turn anonymous cb rows and
+    /// texture slots into the parameter and texture names the material actually uses.
+    /// </summary>
+    private void CaptureCodeSource(UMaterialInterface material, PixelShaderWiring wiring,
+        PreshaderDecodeResult decoded, FUniformExpressionSet expressionSet, FMaterialShaderMap shaderMap)
+    {
+        var source = new MaterialCodeViewSource
+        {
+            MaterialName = material.Name,
+            Wiring = wiring,
+            Preshaders = decoded,
+            Provenance = "Reconstructed from the compiled shader bytecode and uniform expression data in the " +
+                         "cooked shader map — a cook keeps no source, so this is the compiler's dataflow, " +
+                         "printed as expressions. It is the same data the graph draws."
+        };
+
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(shaderMap?.ShaderMapId?.QualityLevel.ToString()))
+            parts.Add($"Quality={shaderMap.ShaderMapId.QualityLevel}");
+        if (shaderMap?.ShaderMapId != null) parts.Add($"FeatureLevel={shaderMap.ShaderMapId.FeatureLevel}");
+        if (!string.IsNullOrEmpty(wiring?.ShaderTypeName)) parts.Add(wiring.ShaderTypeName);
+        source.ShaderDescription = string.Join(" | ", parts);
+
+        // texture binding tables: (slot, index within slot) is how a sample node names its texture
+        for (var slot = 0; slot < (expressionSet.UniformTextureParameters?.Length ?? 0); slot++)
+        {
+            var entries = expressionSet.UniformTextureParameters[slot];
+            for (var index = 0; index < (entries?.Length ?? 0); index++)
+            {
+                var name = entries[index].ParameterInfo?.Name.Text;
+                if (!string.IsNullOrEmpty(name) && name != "None")
+                    source.TextureNames[(slot, index)] = name;
+            }
+        }
+
+        // uniform rows carry the parameter name the shader's cb value came from
+        for (var i = 0; i < (expressionSet.UniformVectorParameters?.Length ?? 0); i++)
+        {
+            var name = expressionSet.UniformVectorParameters[i].ParameterInfo?.Name.Text ??
+                       expressionSet.UniformVectorParameters[i].ParameterName;
+            if (!string.IsNullOrEmpty(name) && name != "None") source.VectorNames[i] = name;
+        }
+        for (var i = 0; i < (expressionSet.UniformScalarParameters?.Length ?? 0); i++)
+        {
+            var name = expressionSet.UniformScalarParameters[i].ParameterInfo?.Name.Text ??
+                       expressionSet.UniformScalarParameters[i].ParameterName;
+            if (!string.IsNullOrEmpty(name) && name != "None") source.ScalarNames[i] = name;
+        }
+
+        _codeSource = source;
     }
 
     private void BuildShaderMapGraph(List<UMaterialInterface> chain, UMaterialInterface shaderMapOwner,
@@ -928,6 +1118,10 @@ public class MaterialGraphViewModel
             if (wiring is { Success: true })
                 wiredPinCount = ApplyPixelShaderWiring(wiring, outputNode, uniformRootNodes, textureNodesBySlot);
         }
+
+        // the code view is the same recovered data printed as expressions, so it is captured here
+        // rather than re-derived: whatever the graph drew is exactly what the text will show
+        CaptureCodeSource(material, wiring, decoded, expressionSet, shaderMap);
 
         var note = new StringBuilder("Reconstructed from compiled shader bytecode — the editor node graph was stripped when this asset was cooked. ");
         note.Append($"{decoded.Uniforms.Count} uniform expression{(decoded.Uniforms.Count == 1 ? "" : "s")} decoded ({decoded.OpcodeSetUsed} opcode set)");
