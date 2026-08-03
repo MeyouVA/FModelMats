@@ -769,6 +769,9 @@ public class MaterialGraphViewModel
                     textureNode.DisplayProperties.Add(new KeyValuePair<string, string>("Texture", textureName));
                 if (texture != null)
                 {
+                    // the shader map only names the texture; the resolved object also knows where it
+                    // lives, which is what a port back into an editor needs
+                    textureNode.DisplayProperties.Add(new KeyValuePair<string, string>("Texture Path", texture.GetPathName()));
                     textureNode.DisplayProperties.Add(new KeyValuePair<string, string>("Compression", texture.CompressionSettings.ToString()));
                     textureNode.DisplayProperties.Add(new KeyValuePair<string, string>("sRGB", texture.SRGB.ToString()));
                     textureNode.DisplayProperties.Add(new KeyValuePair<string, string>("LOD Group", texture.LODGroup.ToString()));

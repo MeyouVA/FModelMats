@@ -475,6 +475,69 @@ public partial class MaterialGraphViewer
     private void OnHideSelectedClicked(object sender, RoutedEventArgs e) => HideSelected();
     private void OnUnhideAllClicked(object sender, RoutedEventArgs e) => UnhideAll();
 
+    /// <summary>
+    /// Writes the Unreal editor script that rebuilds this material. The port's fidelity is shown
+    /// before the file is written, so it is clear what came across exactly and what did not.
+    /// </summary>
+    private void OnPortToUnreal(object sender, RoutedEventArgs e)
+    {
+        MaterialPortResult port;
+        try
+        {
+            port = MaterialUnrealExporter.Build(_viewModel, UnrealDestinationPath);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"The material could not be ported: {exception.Message}",
+                "Port to Unreal", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var summary = new StringBuilder();
+        summary.AppendLine($"Porting '{_viewModel.MaterialName}' to {UnrealDestinationPath}/{port.MaterialName}");
+        summary.AppendLine();
+        foreach (var (key, value) in port.Summary) summary.AppendLine($"{key}: {value}");
+        if (port.Notes.Count > 0)
+        {
+            summary.AppendLine();
+            summary.AppendLine("What does not come across exactly:");
+            foreach (var note in port.Notes.Distinct().Take(14)) summary.AppendLine("  • " + note);
+            if (port.Notes.Distinct().Count() > 14)
+                summary.AppendLine($"  … and {port.Notes.Distinct().Count() - 14} more, all repeated in the script's header.");
+        }
+        summary.AppendLine();
+        summary.AppendLine("Save the script?");
+
+        if (MessageBox.Show(this, summary.ToString(), "Port to Unreal",
+                MessageBoxButton.OKCancel, MessageBoxImage.Information) != MessageBoxResult.OK)
+            return;
+
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Save the Unreal port script",
+            FileName = $"Port_{port.MaterialName}.py",
+            Filter = "Unreal Python script (*.py)|*.py|All files (*.*)|*.*",
+            DefaultExt = ".py"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+
+        try
+        {
+            System.IO.File.WriteAllText(dialog.FileName, port.Script);
+            SelectedNodeText.Text = $"Ported to {System.IO.Path.GetFileName(dialog.FileName)} — " +
+                                    $"{port.ExactNodes} exact, {port.CustomNodes} custom, {port.OutputsConnected} outputs";
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"The script could not be written: {exception.Message}",
+                "Port to Unreal", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>Where the port creates its asset. A content-root path so the script runs in any
+    /// project without editing.</summary>
+    private const string UnrealDestinationPath = "/Game/FModelPorted";
+
     /// <summary>Hides the current selection. Cumulative — already-hidden nodes stay hidden.</summary>
     private void HideSelected()
     {

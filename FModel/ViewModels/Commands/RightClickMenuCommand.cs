@@ -34,6 +34,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
         Decompile,
         MaterialGraph,
         BlueprintGraph,
+        WidgetPreview,
     }
 
     public override async void Execute(ApplicationViewModel contextViewModel, object parameter)
@@ -66,6 +67,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
             "Assets_Decompile" => (EAction.Show, EShowAssetType.Decompile, EBulkType.Code),
             "Assets_Material_Graph" => (EAction.Show, EShowAssetType.MaterialGraph, EBulkType.None),
             "Assets_Blueprint_Graph" => (EAction.Show, EShowAssetType.BlueprintGraph, EBulkType.None),
+            "Assets_Widget_Preview" => (EAction.Show, EShowAssetType.WidgetPreview, EBulkType.None),
 
             "Save_Data" => (EAction.Export, EShowAssetType.None, EBulkType.Raw),
             "Save_Properties" => (EAction.Export, EShowAssetType.None, EBulkType.Properties),
@@ -95,6 +97,7 @@ public class RightClickMenuCommand : ViewModelCommand<ApplicationViewModel>
                     EShowAssetType.References => entry => contextViewModel.CUE4Parse.FindReferences(entry),
                     EShowAssetType.MaterialGraph => entry => contextViewModel.CUE4Parse.ShowMaterialGraph(entry),
                     EShowAssetType.BlueprintGraph => entry => contextViewModel.CUE4Parse.ShowBlueprintGraph(entry),
+                    EShowAssetType.WidgetPreview => entry => contextViewModel.CUE4Parse.ShowWidgetPreview(entry),
                     _ => throw new ArgumentOutOfRangeException("Unsupported asset action type."),
                 };
 

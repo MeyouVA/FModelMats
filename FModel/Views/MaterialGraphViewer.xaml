@@ -59,6 +59,11 @@
                         ToolTip="Hide the selected nodes and their connections (keyboard: H). Adds to whatever is already hidden."/>
                 <Button x:Name="UnhideAllButton" Content="Unhide All" MinWidth="80" Margin="4 0" Click="OnUnhideAllClicked"
                         ToolTip="Show every hidden node again (keyboard: Alt+H)."/>
+
+                <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+                <Button x:Name="PortToUnrealButton" Content="Port to Unreal" MinWidth="105" Margin="4 0" Click="OnPortToUnreal"
+                        ToolTip="Write an Unreal editor Python script that rebuilds this material in a project. Operations with no equivalent Unreal node become Custom HLSL nodes rather than being approximated; the differences are listed before saving."/>
             </WrapPanel>
         </Border>
 

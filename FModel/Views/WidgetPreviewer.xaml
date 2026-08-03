@@ -1,0 +1,136 @@
+<adonisControls:AdonisWindow x:Class="FModel.Views.WidgetPreviewer"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:converters="clr-namespace:FModel.Views.Resources.Converters"
+        xmlns:adonisUi="clr-namespace:AdonisUI;assembly=AdonisUI"
+        xmlns:adonisControls="clr-namespace:AdonisUI.Controls;assembly=AdonisUI"
+        xmlns:adonisExtensions="clr-namespace:AdonisUI.Extensions;assembly=AdonisUI"
+        WindowStartupLocation="CenterScreen" IconVisibility="Collapsed"
+        PreviewKeyDown="OnWindowPreviewKeyDown"
+        Height="{Binding Source={x:Static SystemParameters.MaximizedPrimaryScreenHeight}, Converter={converters:RatioConverter}, ConverterParameter='0.8'}"
+        Width="{Binding Source={x:Static SystemParameters.MaximizedPrimaryScreenWidth}, Converter={converters:RatioConverter}, ConverterParameter='0.8'}">
+    <adonisControls:AdonisWindow.Style>
+        <Style TargetType="adonisControls:AdonisWindow" BasedOn="{StaticResource {x:Type adonisControls:AdonisWindow}}">
+            <Setter Property="Title" Value="Widget Preview"/>
+        </Style>
+    </adonisControls:AdonisWindow.Style>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Toolbar -->
+        <Border Grid.Row="0" Padding="8 4"
+                Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BackgroundBrush}}"
+                adonisExtensions:LayerExtension.IncreaseLayer="True">
+            <WrapPanel Orientation="Horizontal">
+                <TextBlock x:Name="WidgetNameText" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0 0 16 0"/>
+                <TextBlock x:Name="WidgetCountText" VerticalAlignment="Center" Margin="0 0 16 0"/>
+
+                <TextBlock Text="Screen:" VerticalAlignment="Center" Margin="0 0 4 0" Opacity="0.75"/>
+                <ComboBox x:Name="ResolutionCombo" MinWidth="130" Margin="0 0 12 0" VerticalAlignment="Center"
+                          SelectionChanged="OnResolutionChanged"
+                          ToolTip="A cooked widget stores no designer resolution, so the preview arranges the tree for the screen size you pick here."/>
+
+                <Button Content="Fit" MinWidth="52" Margin="4 0" Click="OnFitToView"/>
+                <Button Content="100%" MinWidth="52" Margin="4 0" Click="OnResetZoom"/>
+
+                <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+                <ToggleButton x:Name="OutlinesToggle" Content="Outlines" MinWidth="70" Margin="4 0" IsChecked="True" Click="OnRedrawToggled"
+                              ToolTip="Draw each widget's arranged rectangle, the way the designer shows layout bounds."/>
+                <ToggleButton x:Name="NamesToggle" Content="Names" MinWidth="62" Margin="4 0" Click="OnRedrawToggled"
+                              ToolTip="Label every arranged widget with its variable name."/>
+                <ToggleButton x:Name="HiddenToggle" Content="Show Hidden" MinWidth="92" Margin="4 0" Click="OnRedrawToggled"
+                              ToolTip="Also draw widgets whose serialized Visibility is Hidden or Collapsed — the designer shows these too, dimmed."/>
+                <Button Content="Widget Details" MinWidth="100" Margin="12 0 4 0" Click="OnShowDetails"
+                        ToolTip="Show the class, parent and the notes gathered while reading this widget tree"/>
+            </WrapPanel>
+        </Border>
+
+        <!-- Provenance notice -->
+        <Border Grid.Row="1" Padding="8 4" Background="#40002A3A">
+            <TextBlock x:Name="ProvenanceText" TextWrapping="Wrap" Foreground="#FF7FD0E8"/>
+        </Border>
+
+        <!-- Main content: hierarchy + design surface + details -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" MinWidth="160"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*" MinWidth="200"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="330" MinWidth="220"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Hierarchy -->
+            <Border Grid.Column="0"
+                    Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BackgroundBrush}}"
+                    adonisExtensions:LayerExtension.IncreaseLayer="True">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Border Grid.Row="0" Padding="8 6"
+                            Background="{DynamicResource {x:Static adonisUi:Brushes.Layer2BackgroundBrush}}">
+                        <TextBlock Text="Hierarchy" FontWeight="SemiBold" FontSize="13"/>
+                    </Border>
+                    <TreeView x:Name="HierarchyTree" Grid.Row="1" BorderThickness="0" Background="Transparent"
+                              SelectedItemChanged="OnHierarchySelectionChanged"/>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"
+                          Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+            <!-- Design surface -->
+            <Border x:Name="CanvasHost" Grid.Column="2" ClipToBounds="True" Background="#FF1B1B1B"/>
+
+            <GridSplitter Grid.Column="3" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"
+                          Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+            <!-- Details -->
+            <Border Grid.Column="4"
+                    Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BackgroundBrush}}"
+                    adonisExtensions:LayerExtension.IncreaseLayer="True">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Border Grid.Row="0" Padding="8 6"
+                            Background="{DynamicResource {x:Static adonisUi:Brushes.Layer2BackgroundBrush}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="DetailsTitleText" Text="Details" FontWeight="SemiBold" FontSize="13" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Content="Copy" MinWidth="50" Padding="6 1" Click="OnCopyPanel"
+                                    ToolTip="Copy everything shown in this panel to the clipboard"/>
+                        </Grid>
+                    </Border>
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="DetailsPanel" Margin="8 4"/>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- Status bar -->
+        <Border Grid.Row="3" Padding="8 4"
+                Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BackgroundBrush}}"
+                adonisExtensions:LayerExtension.IncreaseLayer="True">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="ZoomText" Text="Zoom: 100%" VerticalAlignment="Center" Margin="0 0 16 0"/>
+                <TextBlock x:Name="SelectedWidgetText" VerticalAlignment="Center" Margin="0 0 16 0"/>
+                <TextBlock Text="LMB: select  •  RMB/MMB drag: pan  •  Wheel: zoom  •  Ctrl+C: copy details"
+                           VerticalAlignment="Center" Opacity="0.55"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</adonisControls:AdonisWindow>

@@ -1687,6 +1687,37 @@ public class CUE4ParseViewModel : ViewModel
         }
     }
 
+    public void ShowWidgetPreview(GameFile entry)
+    {
+        try
+        {
+            var package = Provider.LoadPackage(entry);
+            var widget = WidgetPreviewViewModel.ExtractFromPackage(package, Provider);
+            if (widget == null)
+            {
+                FLogger.Append(ELog.Warning, () => FLogger.Text($"No widget tree found in '{entry.Name}'", Constants.WHITE, true));
+                return;
+            }
+            if (widget.Root == null)
+            {
+                FLogger.Append(ELog.Warning, () => FLogger.Text($"'{entry.Name}' has a widget tree with no root widget", Constants.WHITE, true));
+                return;
+            }
+
+            var windowTitle = string.IsNullOrEmpty(widget.ClassName)
+                ? "Widget Preview"
+                : $"Widget Preview - {widget.ClassName}";
+            Application.Current.Dispatcher.Invoke(delegate
+            {
+                Helper.GetWindow<WidgetPreviewer>(windowTitle, () => new WidgetPreviewer(widget).Show());
+            });
+        }
+        catch (Exception e)
+        {
+            FLogger.Append(ELog.Warning, () => FLogger.Text($"Failed to build widget preview: {e.Message}", Constants.WHITE, true));
+        }
+    }
+
     public void FindReferences(GameFile entry)
     {
         var refs = Provider.ScanForPackageRefs(entry);
