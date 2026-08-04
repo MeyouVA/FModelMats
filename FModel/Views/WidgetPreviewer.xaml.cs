@@ -33,6 +33,8 @@ public partial class WidgetPreviewer
     private UmgWidgetNode _selectedNode;
     private readonly Dictionary<UmgWidgetNode, TreeViewItem> _treeItems = new();
     private readonly Dictionary<UmgWidgetNode, Rectangle> _hitRects = new();
+    private readonly Dictionary<UmgWidgetNode, TextBlock> _eyeGlyphs = new();
+    private readonly Dictionary<UmgWidgetNode, FrameworkElement> _treeHeaders = new();
     private Rectangle _selectionOutline;
     private bool _suppressTreeEvents;
 
@@ -89,6 +91,7 @@ public partial class WidgetPreviewer
         BuildHierarchy();
         DrawTree();
         ShowDetails();
+        UpdateHiddenCount();
         Dispatcher.BeginInvoke(FitToView);
     }
 
@@ -158,6 +161,9 @@ public partial class WidgetPreviewer
     private void DrawNode(UmgWidgetNode node, double inheritedOpacity)
     {
         if (!node.IsArranged) return;
+        // a widget hidden in the preview takes its children with it, the way hiding a panel in the
+        // designer hides what it contains — the arrangement is untouched, only the paint pass stops
+        if (node.PreviewHidden) return;
 
         var showHidden = HiddenToggle.IsChecked == true;
         if (!node.IsPainted && !showHidden) return;
@@ -370,6 +376,9 @@ public partial class WidgetPreviewer
 
     private void AddHitTargets(UmgWidgetNode node)
     {
+        // hidden widgets give up their hit targets too, so a click reaches whatever they were covering
+        if (node.PreviewHidden) return;
+
         if (node.IsArranged && node.ArrangedWidth > 0 && node.ArrangedHeight > 0 &&
             (node.IsPainted || HiddenToggle.IsChecked == true))
         {
@@ -399,6 +408,9 @@ public partial class WidgetPreviewer
             return;
         }
         _selectionOutline.Visibility = Visibility.Visible;
+        // a hidden widget keeps its outline so you can still see the space it holds, drawn dashed to
+        // say nothing is being painted there
+        _selectionOutline.StrokeDashArray = _selectedNode.PreviewHidden ? new DoubleCollection([4, 3]) : null;
         _selectionOutline.Width = _selectedNode.ArrangedWidth;
         _selectionOutline.Height = _selectedNode.ArrangedHeight;
         Canvas.SetLeft(_selectionOutline, _selectedNode.ArrangedX);
@@ -594,6 +606,8 @@ public partial class WidgetPreviewer
     {
         HierarchyTree.Items.Clear();
         _treeItems.Clear();
+        _eyeGlyphs.Clear();
+        _treeHeaders.Clear();
         if (_viewModel.Root == null) return;
         HierarchyTree.Items.Add(BuildTreeItem(_viewModel.Root));
     }
@@ -601,6 +615,22 @@ public partial class WidgetPreviewer
     private TreeViewItem BuildTreeItem(UmgWidgetNode node)
     {
         var header = new StackPanel { Orientation = Orientation.Horizontal };
+
+        // the designer puts a visibility toggle on every hierarchy row; this one is preview-only
+        var eye = new TextBlock
+        {
+            Text = EyeGlyph(node),
+            Width = 16,
+            Margin = new Thickness(0, 0, 4, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            Cursor = Cursors.Hand,
+            Tag = node,
+            ToolTip = "Hide or show this widget in the preview (H / Alt+H)"
+        };
+        eye.MouseLeftButtonDown += OnEyeClicked;
+        header.Children.Add(eye);
+        _eyeGlyphs[node] = eye;
+
         header.Children.Add(new TextBlock { Text = node.Name, FontWeight = FontWeights.SemiBold });
         header.Children.Add(new TextBlock
         {
@@ -616,6 +646,8 @@ public partial class WidgetPreviewer
         var item = new TreeViewItem { Header = header, Tag = node, IsExpanded = true };
         foreach (var child in node.Children) item.Items.Add(BuildTreeItem(child));
         _treeItems[node] = item;
+        _treeHeaders[node] = header;
+        ApplyHiddenRowStyle(node);
         return item;
     }
 
@@ -639,6 +671,79 @@ public partial class WidgetPreviewer
         item.IsSelected = true;
         item.BringIntoView();
         _suppressTreeEvents = false;
+    }
+
+    // ---------------------------------------------------------------- hide / unhide
+
+    /// <summary>Hiding is a property of this preview alone: the widget stays in the tree, keeps the
+    /// geometry the layout pass gave it and is still selectable from the hierarchy — only the paint
+    /// and hit-test passes skip it, which is what makes it useful for looking underneath a panel.</summary>
+    private void SetPreviewHidden(UmgWidgetNode node, bool hidden)
+    {
+        if (node == null || node.PreviewHidden == hidden) return;
+        node.PreviewHidden = hidden;
+        ApplyHiddenRowStyle(node);
+        DrawTree();
+        UpdateHiddenCount();
+        if (node == _selectedNode) ShowDetails();
+    }
+
+    private void OnHideSelected(object sender, RoutedEventArgs e) => HideSelected();
+
+    private void HideSelected()
+    {
+        if (_selectedNode == null)
+        {
+            SelectedWidgetText.Text = "Select a widget first, then press H to hide it";
+            return;
+        }
+        SetPreviewHidden(_selectedNode, true);
+    }
+
+    private void OnUnhideAll(object sender, RoutedEventArgs e) => UnhideAll();
+
+    private void UnhideAll()
+    {
+        var changed = false;
+        foreach (var node in _viewModel.AllNodes)
+        {
+            if (!node.PreviewHidden) continue;
+            node.PreviewHidden = false;
+            ApplyHiddenRowStyle(node);
+            changed = true;
+        }
+        if (!changed) return;
+
+        DrawTree();
+        UpdateHiddenCount();
+        ShowDetails();
+    }
+
+    private void OnEyeClicked(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not TextBlock { Tag: UmgWidgetNode node }) return;
+        SelectNode(node, fromTree: false);
+        SetPreviewHidden(node, !node.PreviewHidden);
+        e.Handled = true;  // the row's own selection has already been done above
+    }
+
+    private static string EyeGlyph(UmgWidgetNode node) => node.PreviewHidden ? "○" : "◉";
+
+    private void ApplyHiddenRowStyle(UmgWidgetNode node)
+    {
+        if (_eyeGlyphs.TryGetValue(node, out var eye))
+        {
+            eye.Text = EyeGlyph(node);
+            eye.Opacity = node.PreviewHidden ? 0.45 : 0.9;
+        }
+        if (_treeHeaders.TryGetValue(node, out var header)) header.Opacity = node.PreviewHidden ? 0.5 : 1.0;
+    }
+
+    private void UpdateHiddenCount()
+    {
+        var hidden = _viewModel.AllNodes.Count(n => n.PreviewHidden);
+        HiddenCountText.Text = hidden == 0 ? "" : $"Hidden in preview: {hidden}";
+        UnhideAllButton.IsEnabled = hidden > 0;
     }
 
     // ---------------------------------------------------------------- details panel
@@ -679,6 +784,7 @@ public partial class WidgetPreviewer
         AddDetailRow("Class", node.ClassName);
         AddDetailRow("Arranges As", node.Kind.ToString());
         AddDetailRow("Visibility", node.Visibility.ToString());
+        if (node.PreviewHidden) AddDetailRow("Preview", "hidden here only — the asset is unchanged (Alt+H to unhide all)");
         if (Math.Abs(node.RenderOpacity - 1) > 1e-4) AddDetailRow("Render Opacity", node.RenderOpacity.ToString("0.###"));
         if (!node.IsEnabled) AddDetailRow("Enabled", "false");
         if (node.ExpandedFrom != null) AddDetailRow("Expanded From", node.ExpandedFrom);
@@ -916,6 +1022,16 @@ public partial class WidgetPreviewer
     private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape) { Close(); return; }
-        if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control) OnCopyPanel(sender, e);
+        if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control) { OnCopyPanel(sender, e); return; }
+
+        // an Alt chord arrives as Key.System with the real key in SystemKey
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key != Key.H) return;
+
+        if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)) UnhideAll();
+        else if (Keyboard.Modifiers == ModifierKeys.None) HideSelected();
+        else return;
+
+        e.Handled = true;
     }
 }

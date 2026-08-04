@@ -191,6 +191,12 @@ public class UmgWidgetNode
     public readonly List<string> Notes = [];
     public readonly List<KeyValuePair<string, string>> Details = [];
 
+    /// <summary>Viewer-only: the user hid this widget in the preview to see what sits behind it.
+    /// This is not serialized data and is deliberately kept apart from <see cref="Visibility"/> — it
+    /// changes nothing about the asset and does not take part in the layout pass, so the arrangement
+    /// stays exactly as the widget cooked it while the paint pass skips this node and its subtree.</summary>
+    public bool PreviewHidden;
+
     public bool IsVisibleForLayout => Visibility != EUmgVisibility.Collapsed;
     public bool IsPainted => Visibility is not (EUmgVisibility.Collapsed or EUmgVisibility.Hidden);
 

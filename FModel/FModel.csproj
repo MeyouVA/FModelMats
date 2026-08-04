@@ -264,6 +264,16 @@
     <Resource Include="Resources\tl_next.png" />
   </ItemGroup>
 
+  <!-- A single-file publish still drops the native .pdb that ships inside the SkiaSharp/HarfBuzz
+       package next to the exe. It is not needed to run, so leave it out and let the publish folder
+       hold exactly one file. -->
+  <Target Name="DropSymbolsFromSingleFilePublish" AfterTargets="ComputeResolvedFilesToPublishList"
+          Condition="'$(PublishSingleFile)' == 'true'">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Extension)' == '.pdb'" />
+    </ItemGroup>
+  </Target>
+
   <ItemGroup>
     <Compile Update="Properties\Resources.Designer.cs">
       <DesignTime>True</DesignTime>

@@ -46,6 +46,14 @@
                               ToolTip="Label every arranged widget with its variable name."/>
                 <ToggleButton x:Name="HiddenToggle" Content="Show Hidden" MinWidth="92" Margin="4 0" Click="OnRedrawToggled"
                               ToolTip="Also draw widgets whose serialized Visibility is Hidden or Collapsed — the designer shows these too, dimmed."/>
+                <Border Width="1" Margin="12 2" Background="{DynamicResource {x:Static adonisUi:Brushes.Layer1BorderBrush}}"/>
+
+                <Button x:Name="HideSelectedButton" Content="Hide (H)" MinWidth="70" Margin="4 0" Click="OnHideSelected"
+                        ToolTip="Hide the selected widget and its children in this preview so you can see what sits behind them. Preview only — nothing about the asset changes."/>
+                <Button x:Name="UnhideAllButton" Content="Unhide All (Alt+H)" MinWidth="118" Margin="4 0" Click="OnUnhideAll"
+                        ToolTip="Show every widget hidden in this preview again."/>
+                <TextBlock x:Name="HiddenCountText" VerticalAlignment="Center" Margin="8 0 0 0" Opacity="0.75"/>
+
                 <Button Content="Widget Details" MinWidth="100" Margin="12 0 4 0" Click="OnShowDetails"
                         ToolTip="Show the class, parent and the notes gathered while reading this widget tree"/>
             </WrapPanel>
@@ -128,7 +136,7 @@
             <StackPanel Orientation="Horizontal">
                 <TextBlock x:Name="ZoomText" Text="Zoom: 100%" VerticalAlignment="Center" Margin="0 0 16 0"/>
                 <TextBlock x:Name="SelectedWidgetText" VerticalAlignment="Center" Margin="0 0 16 0"/>
-                <TextBlock Text="LMB: select  •  RMB/MMB drag: pan  •  Wheel: zoom  •  Ctrl+C: copy details"
+                <TextBlock Text="LMB: select  •  H: hide selected  •  Alt+H: unhide all  •  RMB/MMB drag: pan  •  Wheel: zoom  •  Ctrl+C: copy details"
                            VerticalAlignment="Center" Opacity="0.55"/>
             </StackPanel>
         </Border>
